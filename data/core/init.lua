@@ -27,8 +27,8 @@ local function save_session()
   local fp = io.open(USERDIR .. PATHSEP .. "session.lua", "w")
   if fp then
     fp:write("return {recents=", common.serialize(core.recent_projects),
-      ", window=", common.serialize(table.pack(system.get_window_size())),
-      ", window_mode=", common.serialize(system.get_window_mode()),
+      ", window=", common.serialize(table.pack(system.get_window_size(core.window))),
+      ", window_mode=", common.serialize(system.get_window_mode(core.window)),
       ", previous_find=", common.serialize(core.previous_find),
       ", previous_replace=", common.serialize(core.previous_replace),
       "}\n")
@@ -102,7 +102,7 @@ local function strip_leading_path(filename)
 end
 
 local function strip_trailing_slash(filename)
-  if filename:match("[^:][/\\]$") then
+  if filename:match("[^:]["..PATHSEP.."]$") then
     return filename:sub(1, -2)
   end
   return filename
@@ -120,9 +120,7 @@ local function show_max_files_warning(dir)
     "Too many files in project directory: stopped reading at "..
     config.max_project_files.." files. For more information see "..
     "usage.md at https://github.com/lite-xl/lite-xl."
-  if core.status_view then
-    core.status_view:show_message("!", style.accent, message)
-  end
+  core.warn(message)
 end
 
 
@@ -184,7 +182,7 @@ local function refresh_directory(topdir, target)
     directory_start_idx = directory_start_idx + 1
   end
 
-  local files = dirwatch.get_directory_files(topdir, topdir.name, (target or ""), {}, 0, function() return false end)
+  local files = dirwatch.get_directory_files(topdir, topdir.name, (target or ""), 0, function() return false end)
   local change = false
 
   -- If this file doesn't exist, we should be calling this on our parent directory, assume we'll do that.
@@ -265,7 +263,7 @@ function core.add_project_directory(path)
 
   local fstype = PLATFORM == "Linux" and system.get_fs_type(topdir.name) or "unknown"
   topdir.force_scans = (fstype == "nfs" or fstype == "fuse")
-  local t, complete, entries_count = dirwatch.get_directory_files(topdir, topdir.name, "", {}, 0, timed_max_files_pred)
+  local t, complete, entries_count = dirwatch.get_directory_files(topdir, topdir.name, "", 0, timed_max_files_pred)
   topdir.files = t
   if not complete then
     topdir.slow_filesystem = not complete and (entries_count <= config.max_project_files)
@@ -574,22 +572,22 @@ local config = require "core.config"
 --
 -- Here some examples:
 --
--- "^%." match any file of directory whose basename begins with a dot.
+-- "^%." matches any file of directory whose basename begins with a dot.
 --
--- When there is an '/' or a '/$' at the end the pattern it will only match
+-- When there is an '/' or a '/$' at the end, the pattern will only match
 -- directories. When using such a pattern a final '/' will be added to the name
 -- of any directory entry before checking if it matches.
 --
 -- "^%.git/" matches any directory named ".git" anywhere in the project.
 --
--- If a "/" appears anywhere in the pattern except if it appears at the end or
--- is immediately followed by a '$' then the pattern will be applied to the full
+-- If a "/" appears anywhere in the pattern (except when it appears at the end or
+-- is immediately followed by a '$'), then the pattern will be applied to the full
 -- path of the file or directory. An initial "/" will be prepended to the file's
 -- or directory's path to indicate the project's root.
 --
 -- "^/node_modules/" will match a directory named "node_modules" at the project's root.
--- "^/build.*/" match any top level directory whose name begins with "build"
--- "^/subprojects/.+/" match any directory inside a top-level folder named "subprojects".
+-- "^/build.*/" will match any top level directory whose name begins with "build".
+-- "^/subprojects/.+/" will match any directory inside a top-level folder named "subprojects".
 
 -- You may activate some plugins on a per-project basis to override the user's settings.
 -- config.plugins.trimwitespace = true
@@ -691,12 +689,16 @@ function core.init()
     EXEDIR  = common.normalize_volume(EXEDIR)
   end
 
+  core.window = renwindow._restore()
+  if core.window == nil then
+    core.window = renwindow.create("")
+  end
   do
     local session = load_session()
     if session.window_mode == "normal" then
-      system.set_window_size(table.unpack(session.window))
+      system.set_window_size(core.window, table.unpack(session.window))
     elseif session.window_mode == "maximized" then
-      system.set_window_mode("maximized")
+      system.set_window_mode(core.window, "maximized")
     end
     core.recent_projects = session.recents or {}
     core.previous_find = session.previous_find or {}
@@ -760,7 +762,7 @@ function core.init()
   cur_node = cur_node:split("down", core.command_view, {y = true})
   cur_node = cur_node:split("down", core.status_view, {y = true})
 
-  -- Load defaiult commands first so plugins can override them
+  -- Load default commands first so plugins can override them
   command.add_defaults()
 
   -- Load user module, plugins and project module
@@ -788,7 +790,7 @@ function core.init()
     end
   end
 
-  -- Load core plugins after user ones to let the user override them
+  -- Load core and user plugins giving preference to user ones with same name.
   local plugins_success, plugins_refuse_list = core.load_plugins()
 
   do
@@ -810,7 +812,11 @@ function core.init()
   end
 
   if not plugins_success or got_user_error or got_project_error then
-    command.perform("core:open-log")
+    -- defer LogView to after everything is initialized,
+    -- so that EmptyView won't be added after LogView.
+    core.add_thread(function()
+      command.perform("core:open-log")
+    end)
   end
 
   core.configure_borderless_window()
@@ -920,7 +926,10 @@ end
 
 
 function core.restart()
-  quit_with_function(function() core.restart_request = true end)
+  quit_with_function(function()
+    core.restart_request = true
+    core.window:_persist()
+  end)
 end
 
 
@@ -1125,8 +1134,14 @@ function core.show_title_bar(show)
 end
 
 
+local thread_counter = 0
 function core.add_thread(f, weak_ref, ...)
-  local key = weak_ref or #core.threads + 1
+  local key = weak_ref
+  if not key then
+    thread_counter = thread_counter + 1
+    key = thread_counter
+  end
+  assert(core.threads[key] == nil, "Duplicate thread reference")
   local args = {...}
   local fn = function() return core.try(f, table.unpack(args)) end
   core.threads[key] = { cr = coroutine.create(fn), wake = 0 }
@@ -1274,6 +1289,9 @@ function core.on_event(type, ...)
   elseif type == "textediting" then
     ime.on_text_editing(...)
   elseif type == "keypressed" then
+    -- In some cases during IME composition input is still sent to us
+    -- so we just ignore it.
+    if ime.editing then return false end
     did_keymap = keymap.on_key_pressed(...)
   elseif type == "keyreleased" then
     keymap.on_key_released(...)
@@ -1298,24 +1316,11 @@ function core.on_event(type, ...)
   elseif type == "touchmoved" then
     core.root_view:on_touch_moved(...)
   elseif type == "resized" then
-    core.window_mode = system.get_window_mode()
+    core.window_mode = system.get_window_mode(core.window)
   elseif type == "minimized" or type == "maximized" or type == "restored" then
     core.window_mode = type == "restored" and "normal" or type
   elseif type == "filedropped" then
-    if not core.root_view:on_file_dropped(...) then
-      local filename, mx, my = ...
-      local info = system.get_file_info(filename)
-      if info and info.type == "dir" then
-        system.exec(string.format("%q %q", EXEFILE, filename))
-      else
-        local ok, doc = core.try(core.open_doc, filename)
-        if ok then
-          local node = core.root_view.root_node:get_child_overlapping_point(mx, my)
-          node:set_active_view(node.active_view)
-          core.root_view:open_doc(doc)
-        end
-      end
-    end
+    core.root_view:on_file_dropped(...)
   elseif type == "focuslost" then
     core.root_view:on_focus_lost(...)
   elseif type == "quit" then
@@ -1358,7 +1363,7 @@ function core.step()
     core.redraw = true
   end
 
-  local width, height = renderer.get_size()
+  local width, height = core.window:get_size()
 
   -- update
   core.root_view.size.x, core.root_view.size.y = width, height
@@ -1378,12 +1383,12 @@ function core.step()
   -- update window title
   local current_title = get_title_filename(core.active_view)
   if current_title ~= nil and current_title ~= core.window_title then
-    system.set_window_title(core.compose_window_title(current_title))
+    system.set_window_title(core.window, core.compose_window_title(current_title))
     core.window_title = current_title
   end
 
   -- draw
-  renderer.begin_frame()
+  renderer.begin_frame(core.window)
   core.clip_rect_stack[1] = { 0, 0, width, height }
   renderer.set_clip_rect(table.unpack(core.clip_rect_stack[1]))
   core.root_view:draw()
@@ -1397,16 +1402,20 @@ local run_threads = coroutine.wrap(function()
     local max_time = 1 / config.fps - 0.004
     local minimal_time_to_wake = math.huge
 
+    local threads = {}
+    -- We modify core.threads while iterating, both by removing dead threads,
+    -- and by potentially adding more threads while we yielded early,
+    -- so we need to extract the threads list and iterate over that instead.
     for k, thread in pairs(core.threads) do
-      -- run thread
-      if thread.wake < system.get_time() then
+      threads[k] = thread
+    end
+
+    for k, thread in pairs(threads) do
+      -- Run thread if it wasn't deleted externally and it's time to resume it
+      if core.threads[k] and thread.wake < system.get_time() then
         local _, wait = assert(coroutine.resume(thread.cr))
         if coroutine.status(thread.cr) == "dead" then
-          if type(k) == "number" then
-            table.remove(core.threads, k)
-          else
-            core.threads[k] = nil
-          end
+          core.threads[k] = nil
         else
           wait = wait or (1/30)
           thread.wake = system.get_time() + wait
@@ -1418,29 +1427,40 @@ local run_threads = coroutine.wrap(function()
 
       -- stop running threads if we're about to hit the end of frame
       if system.get_time() - core.frame_start > max_time then
-        coroutine.yield(0)
+        coroutine.yield(0, false)
       end
     end
 
-    coroutine.yield(minimal_time_to_wake)
+    coroutine.yield(minimal_time_to_wake, true)
   end
 end)
 
 
 function core.run()
   local next_step
+  local last_frame_time
+  local run_threads_full = 0
   while true do
     core.frame_start = system.get_time()
-    local time_to_wake = run_threads()
+    local time_to_wake, threads_done = run_threads()
+    if threads_done then
+      run_threads_full = run_threads_full + 1
+    end
     local did_redraw = false
-    if not next_step or system.get_time() >= next_step then
-      did_redraw = core.step()
+    local did_step = false
+    local force_draw = core.redraw and last_frame_time and core.frame_start - last_frame_time > (1 / config.fps)
+    if force_draw or not next_step or system.get_time() >= next_step then
+      if core.step() then
+        did_redraw = true
+        last_frame_time = core.frame_start
+      end
       next_step = nil
+      did_step = true
     end
     if core.restart_request or core.quit_request then break end
 
     if not did_redraw then
-      if system.window_has_focus() then
+      if system.window_has_focus(core.window) or not did_step or run_threads_full < 2 then
         local now = system.get_time()
         if not next_step then -- compute the time until the next blink
           local t = now - core.blink_start
@@ -1449,7 +1469,7 @@ function core.run()
           local cursor_time_to_wake = dt + 1 / config.fps
           next_step = now + cursor_time_to_wake
         end
-        if time_to_wake > 0 and system.wait_event(math.min(next_step - now, time_to_wake)) then
+        if system.wait_event(math.min(next_step - now, time_to_wake)) then
           next_step = nil -- if we've recevied an event, perform a step
         end
       else
@@ -1457,6 +1477,7 @@ function core.run()
         next_step = nil -- perform a step when we're not in focus if get we an event
       end
     else -- if we redrew, then make sure we only draw at most FPS/sec
+      run_threads_full = 0
       local now = system.get_time()
       local elapsed = now - core.frame_start
       local next_frame = math.max(0, 1 / config.fps - elapsed)
