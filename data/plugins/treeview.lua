@@ -29,7 +29,7 @@ local tooltip_alpha_rate = 1
 
 local function get_depth(filename)
   local n = 1
-  for sep in filename:gmatch("[\\/]") do
+  for _ in filename:gmatch(PATHSEP) do
     n = n + 1
   end
   return n
@@ -442,9 +442,6 @@ function TreeView:draw()
   self:draw_background(style.background2)
   local _y, _h = self.position.y, self.size.y
 
-  local doc = core.active_view.doc
-  local active_filename = doc and system.absolute_path(doc.filename or "")
-
   for item, x,y,w,h in self:each_item() do
     if y + h >= _y and y < _y + _h then
       self:draw_item(item,
@@ -856,7 +853,12 @@ command.add(
   ["treeview:new-file"] = function(item)
     local text
     if not is_project_folder(item.abs_filename) then
-      text = item.filename .. PATHSEP
+      if item.type == "dir" then
+        text = item.filename .. PATHSEP
+      elseif item.type == "file" then
+        local parent_dir = common.dirname(item.filename)
+        text = parent_dir and parent_dir .. PATHSEP
+      end
     end
     core.command_view:enter("Filename", {
       text = text,
@@ -878,7 +880,12 @@ command.add(
   ["treeview:new-folder"] = function(item)
     local text
     if not is_project_folder(item.abs_filename) then
-      text = item.filename .. PATHSEP
+      if item.type == "dir" then
+        text = item.filename .. PATHSEP
+      elseif item.type == "file" then
+        local parent_dir = common.dirname(item.filename)
+        text = parent_dir and parent_dir .. PATHSEP
+      end
     end
     core.command_view:enter("Folder Name", {
       text = text,
