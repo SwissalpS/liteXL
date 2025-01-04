@@ -35,15 +35,15 @@ if [ ! -e "src/api/api.h" ]; then
 fi
 
 # build directory
-bDir="build211";
+bDir="build217";
 # final directory (is in build dir and is the actual product we are making here)
-fDir="liteXLportable2_1_1";
+fDir="liteXLportable217";
 # name of lite executable (SwissalpS has an aversion for dashes/hyphens in names.)
 fExe="liteXL";
 # name of the plugins directory when cloning repository
-pluginsDir="pluginsSwissalpSv3_211";
+pluginsDir="pluginsSwissalpSv3_217";
 # the branch to clone from
-pluginsBranch="SwissalpSpluginVer3liteXLver2_1_1";
+pluginsBranch="SwissalpSv3_217";
 # URI to clone plugins from
 pluginsRepo="https://github.com/SwissalpS/liteXLplugins.git";
 
