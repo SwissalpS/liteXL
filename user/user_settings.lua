@@ -39,11 +39,18 @@ return {
     },
     ["disable_blink"] = false,
     ["disabled_plugins"] = {
+      ["contextmenu"] = true,
       ["endwise"] = true,
       ["eofnewline"] = true,
+      ["gitdiffhighlightstatus"] = true,
+      ["gitstatus"] = true,
+      ["lfautoinsert"] = true,
+      ["lintplus"] = true,
       ["lsp"] = true,
       ["lsp_lua"] = true,
       ["lsp_snippets"] = true,
+      ["minimap"] = true,
+      ["snippets"] = true,
       ["todotreeview"] = true,
       ["toolbarview"] = true
     },
@@ -58,22 +65,57 @@ return {
       ["tabs"] = true
     },
     ["enabled_plugins"] = {
-      ["scale"] = true
+      ["dragdropselected"] = true,
+      ["eval"] = true,
+      ["gitdiff_highlight"] = true,
+      ["indentguide"] = true,
+      ["scale"] = true,
+      ["selectionhighlight"] = true,
+      ["spellcheck"] = true
     },
     ["force_scrollbar_status"] = "expanded",
     ["force_scrollbar_status_mode"] = "global",
     ["fps"] = 32,
     ["indent_size"] = 4,
     ["keep_newline_whitespace"] = true,
+    ["max_log_items"] = 800,
     ["plugins"] = {
+      ["bracketmatch"] = {
+        ["style"] = "underline"
+      },
+      ["codestyle"] = {
+        ["custom_color"] = {
+          [1] = 0,
+          [2] = 211,
+          [3] = 226,
+          [4] = 255
+        },
+        ["enabled"] = true
+      },
+      ["datetimestamps"] = {
+        ["format_datetimestamp"] = "%Y%m%d.%H%M%S"
+      },
       ["dragdropselected"] = {
         ["enabled"] = true,
+        ["maxGhostLines"] = 4,
+        ["useGhost"] = true,
         ["useSticky"] = true
       },
       ["drawwhitespace"] = {
         ["enabled"] = true,
         ["show_selected_only"] = true,
         ["show_trailing_error"] = true
+      },
+      ["git____"] = {
+        ["autoscan"] = true,
+        ["status_shows_branch"] = true
+      },
+      ["gitdiff_highlight"] = {
+        ["use_status"] = true,
+        ["use_treeview"] = false
+      },
+      ["keymap_export"] = {
+        ["export_type"] = "map"
       },
       ["lineguide"] = {
         ["custom_color"] = {
@@ -82,18 +124,53 @@ return {
           [3] = 79,
           [4] = 255
         },
-        ["enabled"] = true
+        ["enabled"] = true,
+        ["rulers"] = {
+          [1] = 80,
+          [2] = 61
+        }
       },
       ["linewrapping"] = {
-        ["indent"] = false,
-        ["mode"] = "word"
+        ["guide"] = false,
+        ["indent"] = true,
+        ["mode"] = "word",
+        ["require_tokenization"] = true
+      },
+      ["minimap"] = {
+        ["caret_color"] = {
+          [1] = 147,
+          [2] = 221,
+          [3] = 250,
+          [4] = 255
+        },
+        ["selection_color"] = {
+          [1] = 82,
+          [2] = 82,
+          [3] = 87,
+          [4] = 255
+        }
       },
       ["scale"] = {
         ["default_scale"] = 1.05,
+        ["mode"] = "code",
         ["use_mousewheel"] = true
       },
+      ["spellcheck"] = {
+        ["files"] = {
+          [1] = "%.txt$",
+          [2] = "%.md$",
+          [3] = "%.markdown$",
+          [4] = "%.tr$",
+          [5] = "%.po$"
+        }
+      },
       ["trimwhitespace"] = {
-        ["enabled"] = true
+        ["enabled"] = true,
+        ["leave_last"] = true,
+        ["trim_empty_end_lines"] = true
+      },
+      ["workspace"] = {
+        ["periodic_save"] = true
       }
     },
     ["tab_type"] = "hard",
