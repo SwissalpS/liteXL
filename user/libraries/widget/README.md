@@ -37,7 +37,7 @@ Components currently provided by this plugin are:
 * [FontsList](fontslist.lua)
 * [InputDialog](inputdialog.lua)
 * [ItemsList](itemslist.lua)
-* [KeybindDiialog](keybinddialog.lua)
+* [KeybindDialog](keybinddialog.lua)
 * [Label](label.lua)
 * [Line](line.lua)
 * [ListBox](listbox.lua)
@@ -45,8 +45,10 @@ Components currently provided by this plugin are:
 * [NoteBook](notebook.lua)
 * [NumberBox](numberbox.lua)
 * [ProgressBar](progressbar.lua)
+* [SearchReplaceList](searchreplacelist.lua)
 * [SelectBox](selectbox.lua)
 * [TextBox](textbox.lua)
+* [TreeList](treelist.lua)
 * [Toggle](toggle.lua)
 
 You can also write your own re-usable components and share them back for

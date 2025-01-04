@@ -3,8 +3,8 @@
 
 local core      = require 'core'
 local command   = require 'core.command'
-local config    = require 'core.config'
 local common    = require 'core.common'
+local config    = require 'core.config'
 local Doc       = require 'core.doc'
 local translate = require 'core.doc.translate'
 local keymap    = require 'core.keymap'
@@ -16,6 +16,7 @@ if config.plugins.autocomplete ~= false then
 end
 
 
+local M       = { }
 local raws    = { }
 local cache   = { }
 local active  = { }
@@ -29,6 +30,25 @@ local DEFAULT_PATTERN  = '([%w_]+)[^%S\n]*$'
 local DEFAULT_MATCH    = { kind = 'lua', pattern = DEFAULT_PATTERN }
 local MATCH_TYPES      = { lua = true }
 local AUTOCOMPLETE_KEY = { }
+
+
+-- config
+
+config.plugins.snippets = common.merge({
+	autoexit = true,
+
+	config_spec = {
+		name = 'Snippets',
+		{
+			label       = 'Automatically exit',
+			description = 'Automatically exit snippets upon text input' ..
+			              'if the leading selection is not on a tabstop.',
+			path        = 'autoexit',
+			type        = 'toggle',
+			default     = true
+		}
+	}
+}, config.plugins.snippets)
 
 
 -- utils
@@ -101,7 +121,7 @@ local function get_raw(raw)
 				core.error('[snippets] no parser for format: %s', fmt)
 				return
 			end
-			local _p = parser(raw.template)
+			local _p = parser(raw.template, raw.p_args)
 			if not _p or not _p.nodes then return end
 			_s = { nodes = common.merge(_p.nodes) }
 			for _, v in ipairs(SNIPPET_FIELDS) do
@@ -182,7 +202,10 @@ local function get_matches(doc, patterns, l1, c1, l2, c2)
 		end
 
 		if not match then
-			core.error('[snippets] failed strict match #%d: \'%s\'', i, p.pattern)
+			core.error(
+				'[snippets] failed strict match #%d: \'%s\'',
+				i, p.pattern
+			)
 			return
 		end
 
@@ -338,20 +361,59 @@ end
 
 -- expand
 
-local function push(_s)
-	watches[_s.ctx.doc] = watches[_s.ctx.doc] or { }
-	local watch = watches[_s.ctx.doc]
-	local w1l, w1c = _s.watch.start_line, _s.watch.start_col
-	local idx = 1
-	for i = #watch, 1, -1 do
-		local w2l, w2c = watch[i].start_line, watch[i].start_col
-		if w2l < w1l or w2l == w1l and w2c < w1c then
-			idx = i + 1; break
-		end
-	end
-	common.splice(watch, idx, 0, _s.watches)
+-- shitty workaround because the watches / selections aren't set when inserting
+-- the first round of snippets, so autoexit exits when inserting them
+local function doc_expect(doc, val)
+	watches[doc] = watches[doc] or { }
+	watches[doc].expect = val
+end
 
-	local a = active[_s.ctx.doc]
+local function w_active_at(w, l1, c1, l2, c2)
+	if not w.active then return end
+
+	if w[1] > l1 or (w[1] == l1 and w[2] > c1) or
+	   w[3] < l2 or (w[3] == l2 and w[4] < c2) then
+		return
+	  end
+
+	for i = #(w.children or { }), 1, -1 do
+		local r = w_active_at(w.children[i], l1, c1, l2, c2)
+		if r then return r end
+	end
+
+	return not w.snippet and w
+end
+
+local function w_cmp(w1, w2)
+	local x
+	x = w2[3] - w1[3]
+	if x > 0 then return true elseif x < 0 then return false end
+	x = w2[4] - w1[4]
+	if x > 0 then return true elseif x < 0 then return false end
+	x = w2[1] - w1[1]
+	if x < 0 then return true elseif x > 0 then return false end
+	x = w2[2] - w1[2]
+	if x < 0 then return true elseif x > 0 then return false end
+	return w2.depth < w1.depth
+end
+
+local function push(_s)
+	local doc = _s.ctx.doc
+
+	if not watches[doc] then
+		watches[doc] = { _s.watch }
+	elseif #watches[doc] == 0 then
+		table.insert(watches[doc], _s.watch)
+	else
+		local w, doc_watches = _s.watch, watches[doc]
+		local idx = #doc_watches
+		while idx > 1 and w_cmp(w, doc_watches[idx]) do
+			idx = idx - 1
+		end
+		table.insert(doc_watches, idx, w)
+	end
+
+	local a = active[doc]
 	local ts = a.tabstops
 	for id, _ in pairs(_s.tabstops) do
 		local c = ts[id]
@@ -364,21 +426,20 @@ local function push(_s)
 end
 
 local function pop(_s)
-	local watch = watches[_s.ctx.doc]
-	local w1, w2 = _s.watches[1], _s.watches[#_s.watches]
-	local i1, i2
-	for i, w in ipairs(watch) do
-		if w == w1 then i1 = i end
-		if w == w2 then i2 = i; break end
+	local doc_watches = watches[_s.ctx.doc]
+	local w = _s.watch
+	for i, _w in ipairs(doc_watches) do
+		if w == _w then
+			table.remove(doc_watches, i)
+		end
 	end
-	common.splice(watch, i1, i2 - i1 + 1)
 
 	local a = active[_s.ctx.doc]
 	local ts = a.tabstops
 	local max = false
 	for id, _ in pairs(_s.tabstops) do
 		ts[id] = ts[id] - 1
-		if id == a.max_id and ts[id] == 0 then max = true end
+		max = max or (a.max_id and ts[id] == 0)
 	end
 	if max then
 		max = 0
@@ -397,38 +458,50 @@ local function pop(_s)
 	table.remove(a, idx)
 end
 
-local function insert_nodes(nodes, doc, l, c, watches, indent)
+local function insert_nodes(nodes, doc, p, l, c, d, indent)
 	local _l, _c
 	for _, n in ipairs(nodes) do
 		local w
 		if n.kind == 'user' then
-			w = { start_line = l, start_col = c }
+			w = { l, c, depth = d, active = false, parent = p }
 			n.watch = w
-			table.insert(watches, w)
 		else
 			n.value = n.value:gsub('\n', indent)
 		end
 		if type(n.value) == 'table' then
-			_l, _c = insert_nodes(n.value.nodes, doc, l, c, watches, indent)
+			w.children = { }
+			_l, _c, d = insert_nodes(
+				n.value.nodes, doc, w, l, c, d + 1, indent
+			)
 		else
 			doc:insert(l, c, n.value)
 			_l, _c = doc:position_offset(l, c, #n.value)
 		end
 		l, c = _l, _c
 		if w then
-			w.end_line, w.end_col = l, c
+			table.insert(p.children, w)
+			w[3], w[4] = l, c
 		end
 	end
-	return l, c
+	return l, c, d
 end
 
-local function expand(_s)
-	_s.watches = { _s.watch }
+local function expand(_s, depth)
 	local ctx = _s.ctx
 	local l, c = ctx.line, ctx.col
+	_s.watch = {
+		l, c, l, c, depth = depth,
+		active = true, snippet = true,
+		children = { }
+	}
 
-	local _l, _c = insert_nodes(_s.nodes, ctx.doc, l, c, _s.watches, '\n' .. ctx.indent_str)
-	_s.watch.end_line, _s.watch.end_col = _l, _c
+	local _l, _c = insert_nodes(
+		_s.nodes, ctx.doc, _s.watch,
+		l, c, depth + 1,
+		'\n' .. ctx.indent_str
+	)
+	_s.max_depth = depth
+	_s.watch[3], _s.watch[4] = _l, _c
 	_s.value = ctx.doc:get_text(l, c, _l, _c)
 
 	push(_s)
@@ -445,13 +518,15 @@ local function transforms_for(_s, id)
 	for n in pairs(nodes) do
 		if n == 'count' then goto continue end
 		local w = n.watch
-		if --[[not w.dirty or]] not n.transform then goto continue end
+		if w.hidden or not w.dirty or not n.transform then goto continue end
 
-		local v = doc:get_text(w.start_line, w.start_col, w.end_line, w.end_col)
+		local v = doc:get_text(w[1], w[2], w[3], w[4])
 		local r = type(n.value) == 'table' and n.value or nil
-		v = n.transform(v, r) or ''
-		doc:remove(w.start_line, w.start_col, w.end_line, w.end_col)
-		doc:insert(w.start_line, w.start_col, v)
+		local _v = n.transform(v, r) or ''
+		if v ~= _v then
+			doc:remove(w[1], w[2], w[3], w[4])
+			doc:insert(w[1], w[2], _v)
+		end
 		w.dirty = false
 
 		::continue::
@@ -464,13 +539,77 @@ local function transforms(snippets, id)
 	end
 end
 
+local function set_active(w, val)
+	while not w.snippet and w.active ~= val do
+		w.active = val
+		w = w.parent
+	end
+end
+
+local function clear_active(snippets)
+	local id = snippets.last_id
+	for _, _s in ipairs(snippets) do
+		for node in pairs(_s.tabstops[id] or { }) do
+			if node ~= 'count' then
+				set_active(node.watch, false)
+			end
+		end
+	end
+end
+
+local function set_hidden(w, into)
+	into = into or { }
+	w.hidden = true
+	into[w] = true
+	if w.children then
+		for _, c in ipairs(w.children) do
+			set_hidden(c, into)
+		end
+	end
+	return into
+end
+
+local function dispatch_sanitize(ts, nodes, hidden)
+	for _, n in ipairs(nodes) do
+		if n.watch and hidden[n.watch] then
+			local id = n.id
+			ts[id] = ts[id] - 1
+		end
+		if type(n.value) == 'table' then
+			dispatch_sanitize(ts, n.value.nodes, hidden)
+		end
+	end
+end
+
+local function sanitize_ts_counts(snippets, hidden)
+	local ts = snippets.tabstops
+	for _, _s in ipairs(snippets) do
+		dispatch_sanitize(ts, _s.nodes, hidden)
+	end
+
+	local new_max = 0
+	for id, count in pairs(ts) do
+		if count > 0 then new_max = math.max(new_max, id) end
+	end
+	snippets.max_id = new_max
+	snippets._tabstops_as_array = nil
+end
+
 -- docview crashes while updating if the doc doesnt have selections
 -- so instead gather all new selections & set it at once
+-- selections also need to be sorted as multicursor editing relies on that
 local function selection_for_watch(sels, w, end_only)
-	table.insert(sels, w.end_line)
-	table.insert(sels, w.end_col)
-	table.insert(sels, end_only and w.end_line or w.start_line)
-	table.insert(sels, end_only and w.end_col  or w.start_col)
+	local i = 1
+	while i < #sels do
+		if sels[i] > w[3] or sels[i] == w[3] and sels[i + 1] > w[4] then
+			break
+		end
+		i = i + 4
+	end
+	common.splice(
+		sels, i, 0,
+		{ w[3], w[4], end_only and w[3] or w[1], end_only and w[4] or w[2] }
+	)
 end
 
 local function select_after(snippets)
@@ -497,7 +636,9 @@ local function next_id(snippets, reverse)
 			for i in pairs(snippets.tabstops) do table.insert(ts, i) end
 			table.sort(ts)
 			local last = 0
-			for i, _id in ipairs(ts) do if _id == id then last = i; break end end
+			for i, _id in ipairs(ts) do
+				if _id == id then last = i; break end
+			end
 			ts = { array = ts, last = last - 1 }
 			snippets._tabstops_as_array = ts
 		end
@@ -526,8 +667,9 @@ local function set_tabstop(snippets, id)
 		local nodes = _s.tabstops[id]
 		if not nodes or nodes.count == 0 then goto continue end
 		for n in pairs(nodes) do
-			if n ~= 'count' then
+			if n ~= 'count' and not n.watch.hidden then
 				selection_for_watch(new_sels, n.watch)
+				set_active(n.watch, true)
 			end
 		end
 		::continue::
@@ -554,89 +696,147 @@ end
 
 local raw_insert, raw_remove = Doc.raw_insert, Doc.raw_remove
 
+local function autoexit(doc)
+	if (watches[doc] and not watches[doc].expect) and
+	    config.plugins.snippets.autoexit and not M.in_snippet(doc, true) then
+		active[doc]  = nil
+		watches[doc] = nil
+		return true
+	end
+end
+
+local function dispatch_insert(w, l1, c1, l2, c2, ldiff, cdiff)
+	local found_aa = false
+
+	if w[3] > l1 then
+		w[3] = w[3] + ldiff
+	-- w[4] == c1: found the append/active
+	elseif w[3] == l1 and w[4] >= c1 then
+		found_aa = w.active and w[4] == c1
+		w[3] = w[3] + ldiff
+		w[4] = w[4] + cdiff
+	else
+		return false
+	end
+
+	if w[1] > l1 then
+		w[1] = w[1] + ldiff
+	-- move start only if not active
+	elseif w[1] == l1 and
+	      (w[2] > c1 or (w[2] == c1 and not found_aa)) then
+		w[1] = w[1] + ldiff
+		w[2] = w[2] + cdiff
+	else
+		w.dirty = true
+	end
+
+	for i = (w.children and #w.children or 0), 1, -1 do
+		if dispatch_insert(w.children[i], l1, c1, l2, c2, ldiff, cdiff) then
+			break
+		end
+	end
+
+	return found_aa
+end
+
+local function dispatch_remove(w, l1, c1, l2, c2, ldiff, cdiff)
+	local hide, hide_s, hide_c = false, false, false
+	local w1, w2, w3, w4 = w[1], w[2], w[3], w[4]
+
+	if w3 > l1 or (w3 == l1 and w4 > c1) then
+		if w3 > l2 then
+			w[3] = w3 - ldiff
+		else
+			hide = w3 < l2 or (w3 == l2 and w4 <= c2)
+			w[3] = l1
+			w[4] = (w3 == l2 and w4 > c2) and w4 - cdiff or c1
+		end
+	else
+		return false
+	end
+
+	if w1 > l1 or (w1 == l1 and w2 > c1) then
+		if w1 > l2 then
+			w[1] = w1 - ldiff
+		else
+			hide_s = w1 > l1 or (w1 == l1 and w2 > c1)
+			w[1] = l1
+			w[2] = (w1 == l2 and w2 > c2) and w2 - cdiff or c1
+		end
+	else
+		hide_c = w1 == l1 and w2 == c1
+		w.dirty = true
+	end
+
+	if not w.snippet and w.active and hide then
+		-- if deletion starts before the watch, hide the watch itself
+		if hide_s then
+			return set_hidden(w)
+		-- if the deletion starts at the start of the watch, hide children
+		elseif hide_c then
+			if not w.children then return true end
+			local ret = { }
+			for _, c in ipairs(w.children) do set_hidden(c, ret) end
+			return ret
+		end
+	end
+
+	for i = (w.children and #w.children or 0), 1, -1 do
+		local r = dispatch_remove(w.children[i], l1, c1, l2, c2, ldiff, cdiff)
+		if r then return r end
+	end
+
+	return false
+end
+
 function Doc:raw_insert(l1, c1, t, undo, ...)
 	raw_insert(self, l1, c1, t, undo, ...)
-	local watch = watches[self]
-	if not watch then return end
+	if autoexit(self) then return end
+
+	local doc_watches = watches[self]
+	if not doc_watches then return end
 
 	local u = undo[undo.idx - 1]
 	local l2, c2 = u[3], u[4]
-
 	local ldiff, cdiff = l2 - l1, c2 - c1
-	for i = #watch, 1, -1 do
-		local w = watch[i]
-		local d1, d2 = true, false
 
-		if w.end_line > l1 then
-			w.end_line = w.end_line + ldiff
-		elseif w.end_line == l1 and w.end_col >= c1 then
-			w.end_line = w.end_line + ldiff
-			w.end_col = w.end_col + cdiff
-		else
-			d1 = false
+	for i = #doc_watches, 1, -1 do
+		if dispatch_insert(doc_watches[i], l1, c1, l2, c2, ldiff, cdiff) then
+			break
 		end
-
-		if w.start_line > l1 then
-			w.start_line = w.start_line + ldiff
-		elseif w.start_line == l1 and w.start_col > c1 then
-			w.start_line = w.start_line + ldiff
-			w.start_col = w.start_col + cdiff
-		else
-			d2 = true
-		end
-
-		w.dirty = w.dirty or (d1 and d2)
 	end
 end
 
 function Doc:raw_remove(l1, c1, l2, c2, ...)
 	raw_remove(self, l1, c1, l2, c2, ...)
-	local watch = watches[self]
-	if not watch then return end
+	if autoexit(self) then return end
+
+	local doc_watches = watches[self]
+	if not doc_watches then return end
 
 	local ldiff, cdiff = l2 - l1, c2 - c1
-	for i = #watch, 1, -1 do
-		local w = watch[i]
-		local d1, d2 = true, false
-		local wsl, wsc, wel, wec = w.start_line, w.start_col, w.end_line, w.end_col
 
-		if wel > l1 or (wel == l1 and wec > c1) then
-			if wel > l2 then
-				w.end_line = wel - ldiff
-			else
-				w.end_line = l1
-				w.end_col = (wel == l2 and wec > c2) and wec - cdiff or c1
-			end
-		else
-			d1 = false
-		end
-
-		if wsl > l1 or (wsl == l1 and wsc > c1) then
-			if wsl > l2 then
-				w.start_line = wsl - ldiff
-			else
-				w.start_line = l1
-				w.start_col = (wsl == l2 and wsc > c2) and wsc - cdiff or c1
-			end
-		else
-			d2 = true
-		end
-
-		w.dirty = w.dirty or (d1 and d2)
+	local h
+	for i = #doc_watches, 1, -1 do
+		h = dispatch_remove(doc_watches[i], l1, c1, l2, c2, ldiff, cdiff)
+		if h then break end
 	end
+
+	if type(h) == 'table' then sanitize_ts_counts(active[self], h) end
 end
 
 
 -- API
--- every function that takes 'snippets' assume that all given snippets are in the same doc
--- and the table has the same schema as return from in_snippet
 
-local M = { parsers = parsers }
+M.parsers = parsers
 
-M.parsers[DEFAULT_FORMAT] = function(s) return { kind = 'static', value = s } end
+M.parsers[DEFAULT_FORMAT] = function(s)
+	return { kind = 'static', value = s }
+end
 
 local function ac_callback(_, item)
-	return M.execute(item.data, nil, true)
+	M.execute(item.data, nil, true)
+	return true
 end
 
 function M.add(snippet)
@@ -645,6 +845,7 @@ function M.add(snippet)
 	if snippet.template then
 		_s.template = snippet.template
 		_s.format   = snippet.format or DEFAULT_FORMAT
+		_s.p_args   = snippet.p_args
 	elseif snippet.nodes then
 		_s.nodes = snippet.nodes
 	else
@@ -689,24 +890,14 @@ function M.execute(snippet, doc, partial)
 	if not doc then return end
 
 	local _t, _s = type(snippet)
-	if _t == 'number' then
-        _s = get_by_id(snippet)
-	elseif _t == 'table' then
-		_s = get_raw(snippet)
-	end
-
+	_s = _t == 'number' and get_by_id(snippet)
+	  or _t == 'table'  and get_raw(snippet)
 	if not _s then return end
 
 	local undo_idx = doc.undo_stack.idx
 
-	-- special handling of autocomplete pt 1
-	-- suggestions are only reset after the item has been handled
-	-- i.e once this function (M.execute) returns
-	-- so at this point here, it still has old suggestions,
-	-- including manually added snippet choices
-	if partial and autocomplete then
-		autocomplete.close()
-	end
+	-- autocomplete hasn't been cleared yet
+	if partial and autocomplete then autocomplete.close() end
 
 	partial = partial and get_partial(doc)
 	local snippets = { }
@@ -733,13 +924,14 @@ function M.execute(snippet, doc, partial)
 			ctx.doc:remove(l1, c1, l2, c2)
 		end
 
-		local matches, removed
 		if idx == 1 then
 			l2, c2 = 1, 1
 		else
 			local _; _, _, l2, c2 = doc:get_selection_idx(idx - 1, true)
 		end
-		ctx.matches, ctx.removed_from_matches = get_matches(doc, _s.matches, l2, c2, l1, c1)
+		ctx.matches, ctx.removed_from_matches = get_matches(
+			doc, _s.matches, l2, c2, l1, c1
+		)
 
 		if not ctx.matches then
 			while doc.undo_stack.idx > undo_idx do doc:undo() end
@@ -752,36 +944,30 @@ function M.execute(snippet, doc, partial)
 
 	local a = {
 		doc = doc, parent = active[doc],
-		tabstops = { }, last_id = 0, max_id = 0
+		tabstops = { }, last_id = 0, max_id = 0,
+		max_depth = 0
 	}
 	active[doc] = a
 
+	doc_expect(doc, true)
+	local depth = a.parent and a.parent.max_depth + 1 or 1
 	for idx, l, c in doc:get_selections(true, true) do
 		_s = snippets[idx]
 		local ctx = _s.ctx
 		ctx.indent_sz, ctx.indent_str = doc:get_line_indent(doc.lines[l])
 		ctx.line, ctx.col = l, c
-		_s.watch = { start_line = l, start_col = c, end_line = l, end_col = c }
-		if not init(_s) or not expand(_s) then
-			-- restores the doc to the original state, except for autocomplete
-			-- since there's no clean way to notify it to show auto suggestions
+		if not init(_s) or not expand(_s, depth) then
 			while doc.undo_stack.idx > undo_idx do doc:undo() end
 			active[doc] = a.parent
 			return
 		end
+		a.max_depth = math.max(a.max_depth, _s.max_depth)
 	end
+	doc_expect(doc, false)
 
-	if a.max_id > 0 then
-		M.next(a)
-	else
-		M.exit(a)
-	end
+	if a.max_id > 0 then M.next(a) else M.exit(a) end
 
-	-- special handling of autocomplete pt 2
-	-- since suggestions are reset once this function returns,
-	-- this means that choices for the 1st tabstop set in the M.next call
-	-- will be removed
-	-- so use on_close to reopen them as a workaround
+	-- autocomplete is cleared when this function (M.exit) returns
 	if autocomplete and autocomplete.map_manually[AUTOCOMPLETE_KEY] then
 		autocomplete.on_close = function()
 			autocomplete.open(autocomplete_cleanup)
@@ -797,22 +983,24 @@ function M.select_current(snippets)
 	if id then set_tabstop(snippets, id) end
 end
 
-function M.next(snippets)
+local function nextprev(snippets, previous)
 	if #snippets == 0 then return end
-	local id = next_id(snippets)
+	local id = next_id(snippets, previous)
 	if id then
-		if snippets.last_id ~= 0 then transforms(snippets, snippets.last_id) end
+		if snippets.last_id ~= 0 then
+			transforms(snippets, snippets.last_id)
+		end
+		clear_active(snippets, snippets.last_id)
 		set_tabstop(snippets, id)
 	end
 end
 
+function M.next(snippets)
+	nextprev(snippets)
+end
+
 function M.previous(snippets)
-	if #snippets == 0 then return end
-	local id = next_id(snippets, true)
-	if id then
-		if snippets.last_id ~= 0 then transforms(snippets, snippets.last_id) end
-		set_tabstop(snippets, id)
-	end
+	nextprev(snippets, true)
 end
 
 function M.exit(snippets)
@@ -834,12 +1022,33 @@ function M.exit(snippets)
 			select_after(snippets)
 		end
 		if snippets == active[doc] then
-			active[doc] = nil
+			active[doc]  = nil
 			watches[doc] = nil
 		else
 			for _, _s in ipairs(snippets) do pop(_s) end
 		end
 	end
+end
+
+function M.exit_all(snippets)
+	if #snippets == 0 then return end
+	local doc = snippets.doc
+	local last
+	while snippets do
+		if snippets.last_id ~= 0 then
+			transforms(snippets, snippets.last_id)
+		end
+		last = snippets
+		snippets = snippets.parent
+	end
+	local c = last.tabstops[0]; c = c and c > 0
+	if c then
+		set_tabstop(last, 0)
+	else
+		select_after(last)
+	end
+	active[doc]  = nil
+	watches[doc] = nil
 end
 
 function M.next_or_exit(snippets)
@@ -852,41 +1061,71 @@ function M.next_or_exit(snippets)
 	end
 end
 
-function M.in_snippet(doc)
+function M.in_snippet(doc, checkpos)
 	doc = doc or core.active_view.doc
 	if not doc then return end
 	local t = active[doc]
-	if t and #t > 0 then return t, t end
+
+	if not t or #t == 0 then
+		return
+	elseif not checkpos then
+		return t, t
+	end
+
+	local min_depth = t.parent and (t.parent.max_depth + 1) or 0
+	local l1, c1, l2, c2 = doc:get_selection(true)
+	l2 = l2 or l1; c2 = c2 or c1
+	for i = #t, 1, -1 do
+		local a = w_active_at(t[i].watch, l1, c1, l2, c2)
+		if a and a.depth > min_depth then
+			return t, t
+		end
+	end
 end
 
 
 -- commands
 
+local function predicate()
+	return M.in_snippet(nil, config.plugins.snippets.autoexit)
+end
+
 command.add(M.in_snippet, {
 	['snippets:select-current'] = M.select_current,
+	['snippets:exit']           = M.exit,
+	['snippets:exit-all']       = M.exit_all
+})
+
+command.add(predicate, {
 	['snippets:next']           = M.next,
 	['snippets:previous']       = M.previous,
-	['snippets:exit']           = M.exit,
 	['snippets:next-or-exit']   = M.next_or_exit
 })
 
 keymap.add {
 	['tab']       = 'snippets:next-or-exit',
 	['shift+tab'] = 'snippets:previous',
-	['escape']    = 'snippets.exit'
+	['escape']    = 'snippets:exit'
 }
 
-do -- 'next' is added to keymap after 'complete' so it overrides autocomplete
-	local keys = keymap.get_bindings('autocomplete:complete')
-	if not keys then goto continue end
-	for _, k in ipairs(keys) do
-		if k == 'tab' then
-			keymap.unbind('tab', 'autocomplete:complete')
-			keymap.add { ['tab'] = 'autocomplete:complete' }
-			break
+
+-- snippets commands are added to the keymap after autocomplete
+-- so autocomplete commands are overriden if they're bound to the same keys
+do
+	local function rebind(key, cmd)
+		local keys = keymap.get_bindings(cmd)
+		if not keys then return end
+		for _, k in ipairs(keys) do
+			if k == key then
+				keymap.unbind(key, cmd)
+				keymap.add { [key] = cmd }
+				break
+			end
 		end
 	end
-	::continue::
+
+	rebind('tab',    'autocomplete:complete')
+	rebind('escape', 'autocomplete:cancel')
 end
 
 

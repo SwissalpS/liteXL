@@ -215,10 +215,22 @@ lsp.user_typed = false
 ---Used on the hover timer to display hover info
 ---@class lsp.hover_position
 ---@field doc core.doc | nil
----@field line integer
----@field col integer
+---@field x number
+---@field y number
 ---@field triggered boolean
-lsp.hover_position = {doc = nil, line = 0, col = 0, triggered = false}
+---@field utf8_range table | nil
+lsp.hover_position = {doc = nil, x = -1, y = -1, triggered = false, utf8_range = nil}
+
+---@type lsp.timer
+lsp.hover_timer = Timer(300, true)
+lsp.hover_timer.on_timer = function()
+  local doc, line, col = lsp.get_hovered_location(lsp.hover_position.x, lsp.hover_position.y)
+  if not doc then return end
+  lsp.hover_position.triggered = true
+  lsp.hover_position.utf8_range = nil
+  lsp.hover_position.doc = doc
+  lsp.request_hover(doc, line, col)
+end
 
 --
 -- Private functions
@@ -235,7 +247,7 @@ local function get_buffer_position_params(doc, line, col)
     },
     position = {
       line = line - 1,
-      character = col - 1
+      character = util.doc_utf8_to_utf16(doc, line, col) - 1
     }
   }
 end
@@ -370,11 +382,13 @@ local function get_references_lists(locations)
 end
 
 ---Apply an lsp textEdit to a document if possible.
+---@param server lsp.server
 ---@param doc core.doc
 ---@param text_edit table
 ---@param is_snippet boolean
+---@param update_cursor_position boolean
 ---@return boolean True on success
-local function apply_edit(doc, text_edit, is_snippet)
+local function apply_edit(server, doc, text_edit, is_snippet, update_cursor_position)
   local range = nil
 
   if text_edit.range then
@@ -387,9 +401,23 @@ local function apply_edit(doc, text_edit, is_snippet)
 
   if not range then return false end
 
-  local line1, col1, line2, col2 = util.toselection(range)
   local text = text_edit.newText
+  local line1, col1, line2, col2
   local current_text = ""
+
+  if
+    not server.capabilities.positionEncoding
+    or
+    server.capabilities.positionEncoding == Server.position_encoding_kind.UTF16
+  then
+    line1, col1, line2, col2 = util.toselection(range, doc)
+  else
+    line1, col1, line2, col2 = util.toselection(range)
+    core.error(
+      "[LSP] Unsupported position encoding: ",
+      server.capabilities.positionEncoding
+    )
+  end
 
   if lsp.in_trigger then
     local cline2, ccol2 = doc:get_selection()
@@ -406,7 +434,9 @@ local function apply_edit(doc, text_edit, is_snippet)
   end
 
   doc:insert(line1, col1, text)
-  doc:set_selection(line2, col1+#text, line2, col1+#text)
+  if update_cursor_position then
+    doc:move_to_cursor(nil, #text)
+  end
 
   return true
 end
@@ -461,6 +491,9 @@ local function autocomplete_onhover(index, item)
           item.desc = item.desc:gsub("[%s\n]+$", "")
             :gsub("^[%s\n]+", "")
             :gsub("\n\n\n+", "\n\n")
+          if symbol.additionalTextEdits then
+            completion_item.additionalTextEdits = symbol.additionalTextEdits
+          end
 
           if server.verbose then
             server:log(
@@ -482,11 +515,12 @@ end
 local function autocomplete_onselect(index, item)
   local completion = item.data.completion_item
   local dv = get_active_docview()
+  local edit_applied = false
   if completion.textEdit then
     if dv then
       local is_snippet = completion.insertTextFormat
         and completion.insertTextFormat == Server.insert_text_format.Snippet
-      local edit_applied = apply_edit(dv.doc, completion.textEdit, is_snippet)
+      edit_applied = apply_edit(item.data.server, dv.doc, completion.textEdit, is_snippet, true)
       if edit_applied then
         -- Retrigger code completion if last char is a trigger
         -- this is useful for example with clangd when autocompleting
@@ -499,14 +533,13 @@ local function autocomplete_onselect(index, item)
         local char = dv.doc:get_char(line, col-1)
         local char_prev = dv.doc:get_char(line, col-2)
         if char:match("%p") or (char == " " and char_prev:match("%p")) then
-          if #dv.doc.lsp_changes > 0 then
+          if not util.table_empty(dv.doc.lsp_changes) then
             lsp.update_document(dv.doc, true)
           else
             lsp.request_completion(dv.doc, line, col, true)
           end
         end
       end
-      return edit_applied
     end
   elseif
     dv and snippets_found and config.plugins.lsp.snippets
@@ -522,29 +555,31 @@ local function autocomplete_onselect(index, item)
       local line1, col1 = doc:position_offset(line2, col2, translate.start_of_word)
       doc:set_selection(line1, col1, line2, col2)
       snippets.execute {format = 'lsp', template = completion.insertText}
-      return true
+      edit_applied = true
     end
   end
-  return false
+  if edit_applied and completion.additionalTextEdits and #completion.additionalTextEdits > 0 then
+    -- TODO: do we need to sort this? Or is it expected to be already sorted?
+    -- TODO: are the edit ranges considered as if the "main" textEdit was applied already?
+
+    -- Apply the edits in reverse order, so that their ranges are not shifted
+    -- around by previous edits
+    for i=#completion.additionalTextEdits,1,-1 do
+      local edit = completion.additionalTextEdits[i]
+      apply_edit(item.data.server, dv.doc, edit, false, false)
+    end
+  end
+  return edit_applied
 end
 
 --
 -- Public functions
 --
 
----Get a language server languageId from language identifier or file extension
----depending on the "id_not_extension" property of the server.
-function lsp.get_language_id(server, doc)
-  if server.id_not_extension then
-    return server.language
-  end
-  return util.file_extension(doc.filename)
-end
-
 ---Open a document location returned by LSP
 ---@param location table
 function lsp.goto_location(location)
-  core.root_view:open_doc(
+  local doc_view = core.root_view:open_doc(
     core.open_doc(
       common.home_expand(
         util.tofilename(location.uri or location.targetUri)
@@ -552,9 +587,9 @@ function lsp.goto_location(location)
     )
   )
   local line1, col1 = util.toselection(
-    location.range or location.targetRange
+    location.range or location.targetRange, doc_view.doc
   )
-  core.active_view.doc:set_selection(line1, col1, line1, col1)
+  doc_view.doc:set_selection(line1, col1, line1, col1)
 end
 
 lsp.get_location_preview = get_location_preview
@@ -589,6 +624,13 @@ function lsp.add_server(options)
   -- so if command name is a list, search for one that exists
   if type(options.command[1]) == "table" then
     options.command[1] = util.get_best_executable(options.command[1])
+  end
+
+  -- On Windows using cmd.exe allows us to take advantage of its ability to run
+  -- the correct executable, as well as running scripts.
+  if PLATFORM == "Windows" and not options.windows_skip_cmd then
+    table.insert(options.command, 1, "/C")
+    table.insert(options.command, 1, "cmd.exe")
   end
 
   if config.plugins.lsp.force_verbosity_off then
@@ -688,7 +730,7 @@ function lsp.get_workspace_settings(server, workspace)
         -- overwrite global settings by those specified in the server if any
         if position == 1 and server.settings then
           if settings_new then
-            util.table_merge(settings_new, server.settings)
+            settings_new = util.deep_merge(settings_new, server.settings)
           else
             settings_new = server.settings
           end
@@ -696,7 +738,7 @@ function lsp.get_workspace_settings(server, workspace)
 
         -- overwrite previous settings with new ones
         if settings_new then
-          util.table_merge(settings, settings_new)
+          settings = util.deep_merge(settings, settings_new)
         end
       end
 
@@ -756,13 +798,12 @@ function lsp.start_server(filename, project_directory)
             "[LSP]: %s was shutdown, revise your configuration",
             sname
           )
-          local last_shutdown = lsp.servers_running[sname].last_shutdown
-            or system.get_time()
+          local last_shutdown = lsp.servers_running[sname].last_shutdown or 0
           lsp.servers_running = util.table_remove_key(
             lsp.servers_running,
             sname
           )
-          if system.get_time() - last_shutdown <= 5 then
+          if system.get_time() - last_shutdown >= 5 then
             lsp.start_servers()
             if lsp.servers_running[sname] then
               lsp.servers_running[sname].last_shutdown = system.get_time()
@@ -829,7 +870,7 @@ function lsp.start_server(filename, project_directory)
               )
               if request.params.selection then
                 local line1, col1, line2, col2 = util.toselection(
-                  request.params.selection
+                  request.params.selection, doc_view.doc
                 )
                 doc_view.doc:set_selection(line1, col1, line2, col2)
               end
@@ -899,6 +940,8 @@ function lsp.start_server(filename, project_directory)
               log_func = "warn"
             elseif params.type == Server.message_type.Info then
               log_func = "log"
+            elseif params.type == Server.message_type.Debug then
+              log_func = "log_quiet"
             end
             core[log_func]("["..server.name.."] message: %s", params.message)
           end
@@ -965,6 +1008,29 @@ function lsp.start_servers()
   end
 end
 
+---Returns the hovered doc and the hovered position.
+---Returns nil if no doc with an LSP activated is under the provided coordinates.
+---@param x number
+---@param y number
+---@return core.doc|nil doc
+---@return integer|nil line
+---@return integer|nil col
+function lsp.get_hovered_location(x, y)
+  local n = core.root_view.root_node:get_child_overlapping_point(x, y)
+  if not n then return end
+  local av = n.active_view
+  if not av:extends(DocView) then return end
+  if av and av.doc.lsp_open then
+    ---@type core.doc
+    local doc = av.doc
+    local line, col = av:resolve_screen_position(x, y)
+    local last_x = av:get_col_x_offset(line, #av.doc.lines[line])
+    local lx, ly = av:get_line_screen_position(line)
+    if x > last_x + lx or y > ly + av:get_line_height() then return end
+    return doc, line, col
+  end
+end
+
 ---Send notification to applicable LSP servers that a document was opened
 ---@param doc core.doc
 function lsp.open_document(doc)
@@ -984,34 +1050,20 @@ function lsp.open_document(doc)
     doc.disable_symbols = true -- disable symbol parsing on autocomplete plugin
     for _, name in pairs(active_servers) do
       local server = lsp.servers_running[name]
-      if
-        server.capabilities.textDocumentSync
-        and
-        (
-          server.capabilities.textDocumentSync
-          ==
-          Server.text_document_sync_kind.Incremental
-          or
-          server.capabilities.textDocumentSync
-          ==
-          Server.text_document_sync_kind.Full
-          or
-          (
-            type(server.capabilities.textDocumentSync) == "table"
-            and
-            server.capabilities.textDocumentSync.openClose
-          )
-        )
-      then
+      if server.capabilities.textDocumentSync.openClose then
+        if server.exit_timer then
+          server.exit_timer:stop()
+          server.exit_timer = nil
+        end
         if file_info.size / 1024 <= 50 then
           -- file size is in range so push the notification as usual.
           server:push_notification('textDocument/didOpen', {
             params = {
               textDocument = {
                 uri = util.touri(doc_path),
-                languageId = lsp.get_language_id(server, doc),
+                languageId = server:get_language_id(doc),
                 version = doc.clean_change_id,
-                text = doc:get_text(1, 1, #doc.lines, #doc.lines[#doc.lines])
+                text = table.concat(doc.lines)
               }
             },
             callback = function() doc.lsp_open = true end
@@ -1020,8 +1072,7 @@ function lsp.open_document(doc)
           -- big files too slow for json encoder, also sending a huge file
           -- without yielding would stall the ui, and some lsp servers have
           -- issues with receiving big files in a single chunk.
-          local text = doc
-            :get_text(1, 1, #doc.lines, #doc.lines[#doc.lines])
+          local text = table.concat(doc.lines)
             :gsub('\\', '\\\\'):gsub("\n", "\\n"):gsub("\r", "\\r")
             :gsub("\t", "\\t"):gsub('"', '\\"'):gsub('\b', '\\b')
             :gsub('\f', '\\f')
@@ -1033,7 +1084,7 @@ function lsp.open_document(doc)
             .. '"params": {\n'
             .. '"textDocument": {\n'
             .. '"uri": "'..util.touri(doc_path)..'",\n'
-            .. '"languageId": "'..lsp.get_language_id(server, doc)..'",\n'
+            .. '"languageId": "'..server:get_language_id(doc)..'",\n'
             .. '"version": '..doc.clean_change_id..',\n'
             .. '"text": "'..text..'"\n'
             .. '}\n'
@@ -1050,16 +1101,6 @@ function lsp.open_document(doc)
       else
         doc.lsp_open = true
       end
-
-      ---@type lsp.timer
-      doc.lsp_hover_timer = Timer(300, true)
-      doc.lsp_hover_timer.on_timer = function()
-        lsp.request_hover(
-          lsp.hover_position.doc,
-          lsp.hover_position.line,
-          lsp.hover_position.col
-        )
-      end
     end
   end
 end
@@ -1073,23 +1114,13 @@ function lsp.save_document(doc)
   if #active_servers > 0 then
     for _, name in pairs(active_servers) do
       local server = lsp.servers_running[name]
-      if
-        server.capabilities.textDocumentSync
-        and
-        type(server.capabilities.textDocumentSync) == "table"
-        and
-        server.capabilities.textDocumentSync.save
-      then
+      local save = server.capabilities.textDocumentSync.save
+      if save then
         -- Send document content only if required by lsp server
-        if
-          type(server.capabilities.textDocumentSync.save) == "table"
-          and
-          server.capabilities.textDocumentSync.save.includeText
-        then
+        if save.includeText then
           -- If save should include file content then raw is faster for
           -- huge files that would take too much to encode.
-          local text = doc
-            :get_text(1, 1, #doc.lines, #doc.lines[#doc.lines])
+          local text = table.concat(doc.lines)
             :gsub('\\', '\\\\'):gsub("\n", "\\n"):gsub("\r", "\\r")
             :gsub("\t", "\\t"):gsub('"', '\\"'):gsub('\b', '\\b')
             :gsub('\f', '\\f')
@@ -1129,18 +1160,12 @@ function lsp.close_document(doc)
   if #active_servers > 0 then
     for _, name in pairs(active_servers) do
       local server = lsp.servers_running[name]
-      if
-        server.capabilities.textDocumentSync
-        and
-        type(server.capabilities.textDocumentSync) == "table"
-        and
-        server.capabilities.textDocumentSync.openClose
-      then
+      if server.capabilities.textDocumentSync.openClose then
         server:push_notification('textDocument/didClose', {
           params = {
             textDocument = {
               uri = util.touri(core.project_absolute_path(doc.filename)),
-              languageId = lsp.get_language_id(server, doc),
+              languageId = server:get_language_id(doc),
               version = doc.clean_change_id
             }
           }
@@ -1172,45 +1197,21 @@ end
 ---@param doc core.doc
 ---@param request_completion? boolean
 function lsp.update_document(doc, request_completion)
-  if not doc.lsp_open or not doc.lsp_changes or #doc.lsp_changes <= 0 then
+  if not doc.lsp_open or not doc.lsp_changes or util.table_empty(doc.lsp_changes) then
     return
   end
 
   for _, name in pairs(lsp.get_active_servers(doc.filename, true)) do
     local server = lsp.servers_running[name]
+    if not doc.lsp_changes[server] or #doc.lsp_changes[server] <= 0 then
+      goto continue
+    end
+    local sync_kind = server.capabilities.textDocumentSync.change
     if
-      server.capabilities.textDocumentSync
-      and
-      (
-        (
-          type(server.capabilities.textDocumentSync) == "table"
-          and
-          server.capabilities.textDocumentSync.change
-          and
-          server.capabilities.textDocumentSync.change
-          ~=
-          Server.text_document_sync_kind.None
-        )
-        or
-        server.capabilities.textDocumentSync
-        ~=
-        Server.text_document_sync_kind.None
-      )
+      sync_kind ~= Server.text_document_sync_kind.None
       and
       server:can_push() -- ensure we don't loose incremental changes
     then
-      local sync_kind = Server.text_document_sync_kind.Incremental
-
-      if
-        type(server.capabilities.textDocumentSync) == "table"
-        and
-        server.capabilities.textDocumentSync.change
-      then
-        sync_kind = server.capabilities.textDocumentSync.change
-      elseif server.capabilities.textDocumentSync then
-        sync_kind = server.capabilities.textDocumentSync
-      end
-
       local completion_callback = nil
       if request_completion then
         completion_callback = function() request_signature_completion(doc) end
@@ -1223,8 +1224,7 @@ function lsp.update_document(doc, request_completion)
       then
         -- If sync should be done by sending full file content then lets do
         -- it raw which is faster for big files.
-        local text = doc
-          :get_text(1, 1, #doc.lines, #doc.lines[#doc.lines])
+        local text = table.concat(doc.lines)
           :gsub('\\', '\\\\'):gsub("\n", "\\n"):gsub("\r", "\\r")
           :gsub("\t", "\\t"):gsub('"', '\\"'):gsub('\b', '\\b')
           :gsub('\f', '\\f')
@@ -1245,7 +1245,7 @@ function lsp.update_document(doc, request_completion)
           .. '}\n'
           .. '}\n',
           callback = function()
-            doc.lsp_changes = {}
+            doc.lsp_changes[server] = nil
             if completion_callback then
               completion_callback()
             end
@@ -1259,10 +1259,10 @@ function lsp.update_document(doc, request_completion)
               uri = util.touri(core.project_absolute_path(doc.filename)),
               version = doc.lsp_version,
             },
-            contentChanges = doc.lsp_changes
+            contentChanges = doc.lsp_changes[server]
           },
           callback = function()
-            doc.lsp_changes = {}
+            doc.lsp_changes[server] = nil
             if completion_callback then
               completion_callback()
             end
@@ -1270,6 +1270,7 @@ function lsp.update_document(doc, request_completion)
         })
       end
     end
+    ::continue::
   end
 end
 
@@ -1533,6 +1534,27 @@ function lsp.request_signature(doc, line, col, forced, fallback)
   end
 end
 
+---Returns the "selection" for the token that includes the provided position.
+---@param doc core.doc
+---@param line integer
+---@param col integer
+---@return integer line1
+---@return integer col2
+---@return integer line2
+---@return integer col2
+local function get_token_range(doc, line, col)
+  local col1 = 0
+  for _, _, text in doc.highlighter:each_token(line) do
+    local text_len = #text
+    local col2 = col1 + text_len
+    if col2 >= col then
+      return line, col1 + 1, line, col2 + 1
+    end
+    col1 = col2
+  end
+  return line, col, line, col+1
+end
+
 ---@type core.node
 local help_active_node = nil
 ---@type core.node
@@ -1549,6 +1571,16 @@ function lsp.request_hover(doc, line, col, in_tab)
         params = get_buffer_position_params(doc, line, col),
         callback = function(server, response)
           if response.result and response.result.contents then
+            local range = response.result.range
+            local line1, col1, line2, col2
+            if range then
+              line1, col1, line2, col2 = util.toselection(range, doc)
+            else
+              line1, col1, line2, col2 = get_token_range(doc, line, col)
+            end
+            lsp.hover_position.utf8_range = { line1 = line1, col1 = col1,
+                                              line2 = line2, col2 = col2 }
+
             local content = response.result.contents
             local kind = nil
             local text = ""
@@ -1650,7 +1682,7 @@ function lsp.request_references(doc, line, col)
               end
             })
           else
-            log(server, "No references found.")
+            core.log("[LSP] No references found.")
           end
         end
       })
@@ -1792,7 +1824,7 @@ function lsp.request_document_symbols(doc)
                   -- the symbol it self.
                   symbol = symbol.location and symbol.location or symbol
                   if not symbol.uri then
-                    local line1, col1 = util.toselection(symbol.range)
+                    local line1, col1 = util.toselection(symbol.range, doc)
                     doc:set_selection(line1, col1, line1, col1)
                   else
                     lsp.goto_location(symbol)
@@ -1836,25 +1868,45 @@ function lsp.request_document_format(doc)
     servers_found = true
     local server = lsp.servers_running[name]
     if server.capabilities.documentFormattingProvider then
+      local trim_trailing_whitespace = false
+      local trim_newlines = false
+      if type(config.plugins.trimwhitespace) == "table"
+         and config.plugins.trimwhitespace.enabled
+      then
+        trim_trailing_whitespace = true
+        trim_newlines = config.plugins.trimwhitespace.trim_empty_end_lines
+      elseif config.plugins.trimwhitespace then -- Plugin enabled with true
+        trim_trailing_whitespace = true
+        trim_newlines = true
+      end
+      local indent_type, indent_size, indent_confirmed = doc:get_indent_info()
+      if not indent_confirmed then
+        indent_type, indent_size = config.tab_type, config.indent_size
+      end
       server:push_request('textDocument/formatting', {
         params = {
           textDocument = {
             uri = util.touri(core.project_absolute_path(doc.filename)),
           },
           options = {
-            tabSize = config.indent_size,
-            insertSpaces = config.tab_type == "soft",
-            trimTrailingWhitespace = config.plugins.trimwhitespace or true,
+            tabSize = indent_size,
+            insertSpaces = indent_type == "soft",
+            trimTrailingWhitespace = trim_trailing_whitespace,
             insertFinalNewline = false,
-            trimFinalNewlines = true
+            trimFinalNewlines = trim_newlines
           }
         },
         callback = function(server, response)
           if response.error and response.error.message then
             log(server, "Error formatting: " .. response.error.message)
           elseif response.result and #response.result > 0 then
-            for _, result in pairs(response.result) do
-              apply_edit(doc, result)
+            -- Apply edits in reverse, as the ranges don't consider
+            -- the intermediate states.
+            -- Consider the TextEdits as already sorted.
+            -- If there are servers that don't sort their TextEdits,
+            -- we'll add sorting code.
+            for i=#response.result,1,-1 do
+              apply_edit(server, doc, response.result[i], false, false)
             end
             log(server, "Formatted document")
           else
@@ -1897,7 +1949,7 @@ function lsp.view_document_diagnostics(doc)
     submit = function(text, item)
       if item then
         local diagnostic = diagnostic_messages[item.index]
-        local line1, col1 = util.toselection(diagnostic.range)
+        local line1, col1 = util.toselection(diagnostic.range, doc)
         doc:set_selection(line1, col1, line1, col1)
       end
     end,
@@ -1998,7 +2050,7 @@ function lsp.goto_symbol(doc, line, col, implementation)
         local location = response.result
 
         if not location or not location.uri and #location == 0 then
-          log(server, "No %s found", method)
+          core.log("[LSP] No %s found.", method)
           return
         end
 
@@ -2150,10 +2202,15 @@ function Doc:on_close()
       end
     end
 
-    if not doc_found then
-      server:exit()
-      core.log("[LSP] stopped %s", name)
-      lsp.servers_running = util.table_remove_key(lsp.servers_running, name)
+    if not doc_found and not server.exit_timer then
+      local t = Timer(server.quit_timeout * 1000, true)
+      t.on_timer = function()
+        server:exit()
+        core.log("[LSP] stopped %s", name)
+        lsp.servers_running = util.table_remove_key(lsp.servers_running, name)
+      end
+      t:start()
+      server.exit_timer = t
     end
   end
 end
@@ -2168,7 +2225,13 @@ local function add_change(self, text, line1, col1, line2, col2)
   change.range["start"] = {line = line1-1, character = col1-1}
   change.range["end"] = {line = line2-1, character = col2-1}
 
-  table.insert(self.lsp_changes, change)
+  for _, name in pairs(lsp.get_active_servers(self.filename, true)) do
+    local server = lsp.servers_running[name]
+    if not self.lsp_changes[server] then
+      self.lsp_changes[server] = {}
+    end
+    table.insert(self.lsp_changes[server], change)
+  end
 
   -- TODO: this should not be needed but changing documents rapidly causes this
   if type(self.lsp_version) ~= 'nil' then
@@ -2184,6 +2247,8 @@ function Doc:raw_insert(line, col, text, undo_stack, time)
   -- skip new files
   if not self.filename then return end
 
+  col = util.doc_utf8_to_utf16(self, line, col)
+
   if self.lsp_open then
     add_change(self, text, line, col, line, col)
     lsp.update_document(self)
@@ -2193,16 +2258,19 @@ function Doc:raw_insert(line, col, text, undo_stack, time)
 end
 
 function Doc:raw_remove(line1, col1, line2, col2, undo_stack, time)
+  local lcol1 = util.doc_utf8_to_utf16(self, line1, col1)
+  local lcol2 = util.doc_utf8_to_utf16(self, line2, col2)
+
   doc_raw_remove(self, line1, col1, line2, col2, undo_stack, time)
 
   -- skip new files
   if not self.filename then return end
 
   if self.lsp_open then
-    add_change(self, "", line1, col1, line2, col2)
+    add_change(self, "", line1, lcol1, line2, lcol2)
     lsp.update_document(self)
   elseif #lsp.get_active_servers(self.filename, true) > 0 then
-    add_change(self, "", line1, col1, line2, col2)
+    add_change(self, "", line1, lcol1, line2, lcol2)
   end
 end
 
@@ -2224,53 +2292,24 @@ function RootView:on_mouse_moved(x, y, dx, dy)
 
   if not config.plugins.lsp.mouse_hover then return end
 
-  local av = get_active_docview()
-
-  if av and av.doc.lsp_open then
-    ---@type core.doc
-    local doc = av.doc
-    local line, col = av:resolve_screen_position(x, y)
-    local line1, col1 = translate.start_of_word(doc, line, col)
-    local line2, col2 = translate.end_of_word(doc, line1, col1)
-    local text = doc:get_text(line1, col1, line2, col2):gsub("%s*", "")
-    local lx1 = av:get_line_screen_position(line1, col1)
-    local lx2 = av:get_line_screen_position(line1, col2)
-    if
-      col >= col1 and col <= col2
-      and
-      text ~= ""
-      and
-      x >= lx1 and x <= lx2
-    then
-      if
-        lsp.hover_position.doc ~= doc
-        or
-        lsp.hover_position.line ~= line1
-        or
-        lsp.hover_position.col ~= col1
-      then
-        listbox.hide()
-
-        lsp.hover_position.triggered = true
-        lsp.hover_position.doc = doc
-        lsp.hover_position.line = line1
-        lsp.hover_position.col = col1
-
-        doc.lsp_hover_timer:set_interval(config.plugins.lsp.mouse_hover_delay)
-        doc.lsp_hover_timer:reset()
-
-        if not doc.lsp_hover_timer:running() then
-          doc.lsp_hover_timer:start()
-        end
+  lsp.hover_position.x = x
+  lsp.hover_position.y = y
+  if lsp.hover_position.triggered then
+    local doc, line, col = lsp.get_hovered_location(x, y)
+    if doc == lsp.hover_position.doc and lsp.hover_position.utf8_range then
+      local utf8_range = lsp.hover_position.utf8_range
+      local line1, col1, line2, col2 = utf8_range.line1, utf8_range.col1,
+                                       utf8_range.line2, utf8_range.col2
+      if (line > line1 or (line == line1 and col >= col1)) and
+         (line < line2 or (line == line2 and col <= col2)) then
+        return
       end
-    else
-      if lsp.hover_position.triggered then
-        listbox.hide()
-        lsp.hover_position.triggered = false
-      end
-      doc.lsp_hover_timer:stop()
     end
+    listbox.hide()
+    lsp.hover_position.triggered = false
   end
+  lsp.hover_timer:set_interval(config.plugins.lsp.mouse_hover_delay)
+  lsp.hover_timer:restart()
 end
 
 --
@@ -2545,27 +2584,35 @@ local function lsp_predicate_symbols()
   return lsp_predicate(nil, nil, true)
 end
 
-if false ~= config.plugins.contextmenu then
-  local menu_found, menu = pcall(require, "plugins.contextmenu")
-  if menu_found then
-    menu:register(lsp_predicate_symbols, {
-      menu.DIVIDER,
-      { text = "Show Symbol Info",        command = "lsp:show-symbol-info" },
-      { text = "Show Symbol Info in Tab", command = "lsp:show-symbol-info-in-tab" },
-      { text = "Goto Definition",         command = "lsp:goto-definition" },
-      { text = "Goto Implementation",     command = "lsp:goto-implementation" },
-      { text = "Find References",         command = "lsp:find-references" }
-    })
+local menu_found, menu = pcall(require, "plugins.contextmenu")
+if menu_found then
+  menu:register(lsp_predicate_symbols, {
+    menu.DIVIDER,
+    { text = "Show Symbol Info",        command = "lsp:show-symbol-info" },
+    { text = "Show Symbol Info in Tab", command = "lsp:show-symbol-info-in-tab" },
+    { text = "Goto Definition",         command = "lsp:goto-definition" },
+    { text = "Goto Implementation",     command = "lsp:goto-implementation" },
+    { text = "Find References",         command = "lsp:find-references" }
+  })
 
-    menu:register(lsp_predicate, {
-      menu.DIVIDER,
-      { text = "Document Symbols",       command = "lsp:view-document-symbols" },
-      { text = "Document Diagnostics",   command = "lsp:view-document-diagnostics" },
-      { text = "Toggle Diagnostics",     command = "lsp:toggle-diagnostics" },
-      { text = "Format Document",        command = "lsp:format-document" },
-    })
+  menu:register(lsp_predicate, {
+    menu.DIVIDER,
+    { text = "Document Symbols",       command = "lsp:view-document-symbols" },
+    { text = "Document Diagnostics",   command = "lsp:view-document-diagnostics" },
+    { text = "Toggle Diagnostics",     command = "lsp:toggle-diagnostics" },
+    { text = "Format Document",        command = "lsp:format-document" },
+  })
+
+  local menu_show = menu.show
+  function menu:show(...)
+    lsp.hover_timer:stop()
+    lsp.hover_timer:reset()
+    listbox.hide()
+    lsp.hover_position.triggered = false
+    menu_show(self, ...)
   end
 end
+
 
 return lsp
 

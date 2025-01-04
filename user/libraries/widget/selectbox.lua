@@ -4,12 +4,14 @@
 -- @license MIT
 --
 
+local core = require "core"
 local common = require "core.common"
 local style = require "core.style"
 local Widget = require "libraries.widget"
 local ListBox = require "libraries.widget.listbox"
 
 ---@class widget.selectbox : widget
+---@overload fun(parent?:widget, label?:string):widget.selectbox
 ---@field private list_container widget
 ---@field private list widget.listbox
 ---@field private selected integer
@@ -25,6 +27,7 @@ function SelectBox:new(parent, label)
   self.size.x = 200 + (style.padding.x * 2)
   self.size.y = self:get_font():get_height() + (style.padding.y * 2)
   self.list_container = Widget()
+  self.list_container.name = self:get_name()
   self.list_container:set_size(
     self.size.x - self.list_container.border.width,
     150
@@ -43,6 +46,22 @@ function SelectBox:new(parent, label)
       self:on_change(self.selected)
     end
     self.list_container:hide_animated(true)
+  end
+
+  -- Hide list if mouse clicked outside
+  self.list_container:force_event("mouse_released")
+  self.list_container.on_mouse_released = function(this, button, x, y)
+    if
+      this:is_visible()
+      and
+      not this:mouse_on_top(x, y) and not self:mouse_on_top(x, y)
+    then
+      this:hide()
+      return false
+    end
+    if this:is_visible() and this:mouse_on_top(x, y) then
+      return Widget.on_mouse_released(this, button, x, y)
+    end
   end
 
   self:set_label(label or "select")
@@ -146,7 +165,7 @@ function SelectBox:reposition_container()
   local y1 = self.position.y + self:get_height()
   local y2 = self.position.y - self.list:get_height()
 
-  local _, h = system.get_window_size()
+  local _, h = system.get_window_size(core.window)
 
   if y1 + self.list:get_height() <= h then
     self.list_container:set_position(

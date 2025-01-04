@@ -5,6 +5,7 @@
 -- @license MIT
 
 local core = require "core"
+local common = require "core.common"
 local config = require "core.config"
 local json = require "plugins.lsp.json"
 
@@ -13,18 +14,77 @@ local util = {}
 ---Check if the given file is currently opened on the editor.
 ---@param abs_filename string
 function util.doc_is_open(abs_filename)
-  -- make path separator consistent
-  abs_filename = abs_filename:gsub("\\", "/")
+  -- Normalize path format to the one used by normal docs
+  abs_filename = common.normalize_path(abs_filename) or abs_filename
   for _, doc in ipairs(core.docs) do
     ---@cast doc core.doc
-    if doc.abs_filename then
-      local doc_path = doc.abs_filename:gsub("\\", "/")
-      if doc_path == abs_filename then
-        return true;
-      end
+    if doc.abs_filename == abs_filename then
+      return true;
     end
   end
   return false
+end
+
+---Converts a utf-8 column position into the equivalent utf-16 position.
+---@param doc core.doc
+---@param line integer
+---@param column integer
+---@return integer col_position
+function util.doc_utf8_to_utf16(doc, line, column)
+  local ltext = doc.lines[line]
+  local ltext_len = ltext and #ltext or 0
+  local ltext_ulen = ltext and utf8extra.len(ltext) or 0
+  column = common.clamp(column, 1, ltext_len > 0 and ltext_len or 1)
+  -- no need for conversion so return column as is
+  if ltext_len == ltext_ulen then return column end
+  if column > 1 then
+    local col = 1
+    for pos, code in utf8extra.next, ltext do
+      if pos >= column then
+        return col
+      end
+      -- Codepoints that high are encoded using surrogate pairs
+      if code < 0x010000 then
+        col = col + 1
+      else
+        col = col + 2
+      end
+    end
+    return col
+  end
+  return column
+end
+
+---Converts a utf-16 column position into the equivalent utf-8 position.
+---@param doc core.doc
+---@param line integer
+---@param column integer
+---@return integer col_position
+function util.doc_utf16_to_utf8(doc, line, column)
+  local ltext = doc.lines[line]
+  local ltext_len = ltext and #ltext or 0
+  local ltext_ulen = ltext and utf8extra.len(ltext) or 0
+  column = common.clamp(column, 1, ltext_len > 0 and ltext_len or 1)
+  -- no need for conversion so return column as is
+  if ltext_len == ltext_ulen then return column end
+  if column > 1 then
+    local col = 1
+    local utf8_pos = 1
+    for pos, code in utf8extra.next, ltext do
+      if col >= column then
+        return pos
+      end
+      utf8_pos = pos
+      -- Codepoints that high are encoded using surrogate pairs
+      if code < 0x010000 then
+        col = col + 1
+      else
+        col = col + 2
+      end
+    end
+    return utf8_pos
+  end
+  return column
 end
 
 ---Split a string by the given delimeter
@@ -32,16 +92,24 @@ end
 ---@param delimeter string Delimeter without lua patterns
 ---@param delimeter_pattern? string Optional delimeter with lua patterns
 ---@return table
+---@return boolean ends_with_delimiter
 function util.split(s, delimeter, delimeter_pattern)
   if not delimeter_pattern then
     delimeter_pattern = delimeter
   end
 
-  local result = {};
-  for match in (s..delimeter):gmatch("(.-)"..delimeter_pattern) do
-    table.insert(result, match);
+  local last_idx = 1
+  local result = {}
+  for match_idx, afer_match_idx in s:gmatch("()"..delimeter_pattern.."()") do
+    table.insert(result, string.sub(s, last_idx, match_idx - 1))
+    last_idx = afer_match_idx
   end
-  return result;
+  if last_idx > #s then
+    return result, true
+  else
+    table.insert(result, string.sub(s, last_idx))
+    return result, false
+  end
 end
 
 ---Get the extension component of a filename.
@@ -104,15 +172,21 @@ end
 
 ---Converts a document range returned by lsp to a valid document selection.
 ---@param range table LSP Range.
+---@param doc? core.doc
 ---@return integer line1
 ---@return integer col1
 ---@return integer line2
 ---@return integer col2
-function util.toselection(range)
+function util.toselection(range, doc)
   local line1 = range.start.line + 1
   local col1 = range.start.character + 1
   local line2 = range['end'].line + 1
   local col2 = range['end'].character + 1
+
+  if doc then
+    col1 = util.doc_utf16_to_utf8(doc, line1, col1)
+    col2 = util.doc_utf16_to_utf8(doc, line2, col2)
+  end
 
   return line1, col1, line2, col2
 end
@@ -288,34 +362,40 @@ function util.table_get_field(t, fieldset)
   return value
 end
 
----Merge the content of table2 into table1.
----Solution found here: https://stackoverflow.com/a/1283608
----@param t1 table
----@param t2 table
-function util.table_merge(t1, t2)
-  for k,v in pairs(t2) do
-    if type(v) == "table" then
-      if type(t1[k] or false) == "table" then
-        util.table_merge(t1[k] or {}, t2[k] or {})
-      else
-        t1[k] = v
+---Merge the content of the tables into a new one.
+---Arguments from the later tables take precedence.
+---Doesn't touch the original tables.
+---`nil` arguments are ignored.
+---@param ... table?
+---@return table
+function util.deep_merge(...)
+  local t = {}
+  local args = table.pack(...)
+  for i=1,args.n do
+    local other = args[i]
+    if other then
+      assert(type(other) == "table", string.format("Argument %d must be a table", i))
+      for k, v in pairs(other) do
+        if type(v) == "table" then
+          if type(t[k]) == "table" then
+            t[k] = util.deep_merge(t[k], v)
+          else
+            t[k] = util.deep_merge({}, v)
+          end
+        else
+          t[k] = v
+        end
       end
-    else
-      t1[k] = v
     end
   end
+  return t
 end
 
 ---Check if a table is really empty.
 ---@param t table
 ---@return boolean
 function util.table_empty(t)
-  local found = false
-  for _, _ in pairs(t) do
-    found = true
-    break
-  end
-  return not found
+  return next(t) == nil
 end
 
 ---Convert markdown to plain text.
@@ -442,9 +522,9 @@ function util.wrap_text(text, font, max_width)
     end
   end
 
-  wrapped_text = wrapped_text:gsub("\n\n\n\n?", "\n\n")
+  wrapped_text = wrapped_text:gsub("\n\n\n\n?", "\n\n"):gsub("%s*$", "")
 
-  return wrapped_text:sub(1, #wrapped_text - 2)
+  return wrapped_text
 end
 
 

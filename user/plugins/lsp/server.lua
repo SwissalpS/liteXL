@@ -11,11 +11,17 @@
 
 local json = require "plugins.lsp.json"
 local util = require "plugins.lsp.util"
+local diagnostics = require "plugins.lsp.diagnostics"
 local Object = require "core.object"
 
 ---@alias lsp.server.callback fun(server: lsp.server, ...)
+---@alias lsp.server.timeoutcb fun(server: lsp.server, ...)
 ---@alias lsp.server.notificationcb fun(server: lsp.server, params: table)
 ---@alias lsp.server.responsecb fun(server: lsp.server, response: table, request?: lsp.server.request)
+
+---@class lsp.server.languagematch
+---@field id string
+---@field pattern string
 
 ---@class lsp.server.request
 ---@field id integer
@@ -27,13 +33,15 @@ local Object = require "core.object"
 ---@field overwritten_callback lsp.server.responsecb | nil
 ---@field sending boolean
 ---@field raw_data string
+---@field timeout number
+---@field timeout_callback lsp.server.timeoutcb | nil
 ---@field timestamp number
 ---@field times_sent integer
 
 ---LSP Server communication library.
 ---@class lsp.server : core.object
 ---@field public name string
----@field public language string
+---@field public language string | lsp.server.languagematch[]
 ---@field public file_patterns table
 ---@field public current_request integer
 ---@field public init_options table
@@ -53,7 +61,10 @@ local Object = require "core.object"
 ---@field public hitrate_list table
 ---@field public requests_per_second integer
 ---@field public proc process | nil
+---@field public quit_timeout number
+---@field public exit_timer lsp.timer | nil
 ---@field public capabilities table
+---@field public custom_capabilities table
 ---@field public yield_on_reads boolean
 ---@field public running boolean
 local Server = Object:extend()
@@ -61,39 +72,57 @@ local Server = Object:extend()
 ---LSP Server constructor options
 ---@class lsp.server.options
 ---@field name string
----@field language string
+---@field language string | lsp.server.languagematch[]
 ---@field file_patterns table<integer, string>
 ---@field command table<integer, string>
+---@field quit_timeout number
+---@field windows_skip_cmd boolean
+---@field env table<string, string>
 ---@field settings table
 ---@field init_options table
+---@field custom_capabilities table
+---@field on_start? fun(server: lsp.server)
 ---@field requests_per_second number
 ---@field incremental_changes boolean
----@field id_not_extension boolean
 Server.options = {
   ---Name of the server
   name = "",
-  ---Programming language identifier
-  language = "",
+  ---Programming language identifier.
+  ---Can be a string or a table.
+  ---If the table is empty, the file extension will be used instead.
+  ---The table should be an array of tables containing `id` and `pattern`.
+  ---The `pattern` will be matched with the file path.
+  ---Will use the `id` of the first `pattern` that matches.
+  ---If no pattern matches, the file extension will be used instead.
+  language = {},
   ---Patterns to match the language files
   file_patterns = {},
   ---Command to launch LSP server and optional arguments
   command = {},
-  ---Optional table of settings to pass into the lsp
+  ---On Windows, avoid running the LSP server with cmd.exe
+  windows_skip_cmd = false,
+  ---Enviroment variables to set for the server command
+  env = {},
+  ---Seconds before closing the server when not needed anymore
+  quit_timeout = 60,
+  ---Optional table of settings to pass into the LSP
   ---Note that also having a settings.json or settings.lua in
   ---your workspace directory is supported
   settings = {},
   ---Optional table of initializationOptions for the LSP
   init_options = {},
+  ---Optional table of capabilities that will be merged with our default one
+  custom_capabilities = {},
+  ---Function called when the server has been started
+  on_start = nil,
   ---Set by default to 16 should only be modified if having issues with a server
   requests_per_second = 32,
   ---Some servers like bash language server support incremental changes
   ---which are more performant but don't advertise it, set to true to force
-  ---incremental changes even if server doesn't advertise them.
+  ---incremental changes even if server doesn't advertise them
   incremental_changes = false,
   ---True to debug the lsp client when developing it
   verbose = false,
-  ---
-  id_not_extension = false
 }
 
 ---Default timeout when sending a request to lsp server.
@@ -173,16 +202,27 @@ Server.message_type = {
 	Error = 1,
 	Warning = 2,
 	Info = 3,
-	Log = 4
+	Log = 4,
+	Debug = 5
+}
+
+---LSP Docs: /#positionEncodingKind
+---@enum
+Server.position_encoding_kind = {
+  UTF8  = 'utf-8',
+  UTF16 = 'utf-16',
+  UTF32 = 'utf-32'
 }
 
 ---@class lsp.server.requestoptions
----@field params table<string,any>
----@field data table @Optional data appended to request.
----@field callback lsp.server.responsecb @Default callback executed when a response is received.
----@field overwrite boolean @Substitute same previous request with new one if not sent.
----@field overwritten_callback lsp.server.responsecb @Executed in place of original response callback if the request should have been overwritten but was already sent.
----@field raw_data string @Request body used when sending a raw request.
+---@field params? table<string,any>
+---@field data? table @Optional data appended to request.
+---@field callback? lsp.server.responsecb @Default callback executed when a response is received.
+---@field overwrite? boolean @Substitute same previous request with new one if not sent.
+---@field overwritten_callback? lsp.server.responsecb @Executed in place of original response callback if the request should have been overwritten but was already sent.
+---@field raw_data? string @Request body used when sending a raw request.
+---@field timeout? number @Timeout in seconds to consider the request unanswered.
+---@field timeout_callback? lsp.server.timeoutcb @Callback executed when the request times out.
 
 ---Get a completion kind label from its id or empty string if not found.
 ---@param id integer
@@ -222,14 +262,50 @@ function Server.get_symbols_kind_list()
   return list
 end
 
+---Given a ServerCapabilities object, return a "normalized" version
+---that simplifies capabilities checks.
+---@param capabilities table
+---returns table
+function Server.normalize_server_capabilities(capabilities)
+  local cap = util.deep_merge({ }, capabilities)
+  local tds = {
+    openClose = false,
+    change = false,
+    willSave = false,
+    willSaveWaitUntil = false,
+    save = false
+  }
+  if cap.textDocumentSync then
+    if type(cap.textDocumentSync) ~= "table" then
+      -- Convert TextDocumentSyncKind into TextDocumentSyncOptions
+      tds = util.deep_merge(tds, {
+        openClose = true,
+        change = cap.textDocumentSync,
+        save = {
+          includeText = false
+        }
+      })
+      cap.textDocumentSync = nil
+    else
+      tds = util.deep_merge(tds, cap.textDocumentSync)
+      if type(tds.save) ~= "table" and tds.save then
+        tds.save = {
+          includeText = false
+        }
+      end
+    end
+  end
+  cap.textDocumentSync = util.deep_merge(cap.textDocumentSync, tds)
+  return cap
+end
+
 ---Instantiates a new LSP server.
----@param options table
+---@param options lsp.server.options
 function Server:new(options)
   Server.super.new(self)
 
   self.name = options.name
   self.language = options.language
-  self.id_not_extension = options.id_not_extension or false
   self.file_patterns = options.file_patterns
   self.current_request = 0
   self.init_options = options.init_options or {}
@@ -243,6 +319,7 @@ function Server:new(options)
   self.raw_list = {}
   self.command = options.command
   self.write_fails = 0
+  self.fatal_error = false
   self.snippets = options.snippets
   self.fake_snippets = options.fake_snippets or false
   -- TODO: We may need to lower this but tests so far show that some servers
@@ -257,12 +334,20 @@ function Server:new(options)
 
   self.proc = process.start(
     options.command, {
-      stderr = process.REDIRECT_PIPE
+      stderr = process.REDIRECT_PIPE,
+      env = options.env
     }
   )
+  self.quit_timeout = options.quit_timeout or 60
+  self.exit_timer = nil
   self.capabilities = nil
+  self.custom_capabilities = options.custom_capabilities
   self.yield_on_reads = false
   self.incremental_changes = options.incremental_changes or false
+
+  self.read_responses_coroutine = nil
+
+  if options.on_start then options.on_start(self) end
 end
 
 ---Starts the LSP server process, any listeners should be registered before
@@ -273,12 +358,12 @@ end
 function Server:initialize(workspace, editor_name, editor_version)
   local root_uri = util.touri(workspace);
 
-  self.running = false
   self.path = workspace or ""
   self.editor_name = editor_name or "unknown"
   self.editor_version = editor_version or "0.1"
 
   self:push_request('initialize', {
+    timeout = 10,
     params = {
       processId = system["get_process_id"] and system.get_process_id() or nil,
       clientInfo = {
@@ -292,7 +377,7 @@ function Server:initialize(workspace, editor_name, editor_version)
         {uri = root_uri, name = util.getpathname(workspace)}
       },
       initializationOptions = self.init_options,
-      capabilities = {
+      capabilities = util.deep_merge({
         workspace = {
           configuration = true -- 'workspace/configuration' requests
         },
@@ -314,7 +399,7 @@ function Server:initialize(workspace, editor_name, editor_version)
               -- preselectSupport = true
               -- tagSupport = {valueSet = {}},
               insertReplaceSupport = true,
-              resolveSupport = {properties = {'documentation', 'detail'}},
+              resolveSupport = {properties = {'documentation', 'detail', 'additionalTextEdits'}},
               -- insertTextModeSupport = {valueSet = {}}
             },
             completionItemKind = {
@@ -386,13 +471,18 @@ function Server:initialize(workspace, editor_name, editor_version)
           --  dynamicRegistration = false, -- not supported
           --  prepareSupport = false
           -- },
-          -- publishDiagnostics = {
-          -- relatedInformation = true,
-          --  tagSupport = {valueSet = {}},
-          --  versionSupport = true,
-          --  codeDescriptionSupport = true,
-          --  dataSupport = true
-          -- },
+          publishDiagnostics = {
+            relatedInformation = true,
+            tagSupport = {
+              valueSet = {
+                diagnostics.tag.UNNECESSARY,
+                diagnostics.tag.DEPRECATED
+              }
+            },
+            versionSupport = true,
+            codeDescriptionSupport = true,
+            dataSupport = false
+          },
           -- foldingRange = {
           --  dynamicRegistration = false, -- not supported
           --  rangeLimit = ?,
@@ -413,16 +503,19 @@ function Server:initialize(workspace, editor_name, editor_version)
           -- moniker = {dynamicRegistration = false} -- not supported
         },
         window = {
-         -- workDoneProgress = true,
-         -- showMessage = {},
-         showDocument = { support = true }
+          -- workDoneProgress = true,
+          -- showMessage = {},
+          showDocument = { support = true }
         },
-        -- general = {
-        --  regularExpressions = {},
-        --  markdown = {}
-        -- },
+        general = {
+          -- regularExpressions = {},
+          -- markdown = {},
+          positionEncodings = {
+            Server.position_encoding_kind.UTF16
+          }
+        },
         -- experimental = nil
-      }
+      }, self.custom_capabilities)
     },
     callback = function(server, response)
       if server.verbose then
@@ -433,7 +526,7 @@ function Server:initialize(workspace, editor_name, editor_version)
       end
       local result = response.result
       if result then
-        server.capabilities = result.capabilities
+        server.capabilities = Server.normalize_server_capabilities(result.capabilities)
         server.info = result.serverInfo
 
         if server.info then
@@ -466,12 +559,17 @@ function Server:add_event_listener(event_name, callback)
     )
   end
 
-  self.event_listeners[event_name] = callback
+  if not self.event_listeners[event_name] then
+    self.event_listeners[event_name] = {}
+  end
+  table.insert(self.event_listeners[event_name], callback)
 end
 
 function Server:send_event_signal(event_name, ...)
   if self.event_listeners[event_name] then
-    self.event_listeners[event_name](self, ...)
+    for _, l in ipairs(self.event_listeners[event_name]) do
+      l(self, ...)
+    end
   else
     self:on_event(event_name)
   end
@@ -573,7 +671,14 @@ end
 function Server:process_notifications()
   if not self.initialized then return end
 
+  -- Clone table as we remove elements while iterating it
+  local notifications = {}
   for index, request in ipairs(self.notification_list) do
+    notifications[index] = request
+  end
+
+  for index, request in ipairs(notifications) do
+    request.sending = true
     local message = {
       jsonrpc = '2.0',
       method = request.method,
@@ -618,6 +723,8 @@ end
 
 ---Sends one of the queued client requests.
 function Server:process_requests()
+  if not self.proc then return end
+
   local remove_request = nil
   for index, request in ipairs(self.request_list) do
     if request.timestamp < os.time() then
@@ -656,10 +763,7 @@ function Server:process_requests()
       end
 
       if written then
-        local time = 1
-        if request.id == 1 then
-          time = 10 -- give initialize enough time to respond
-        end
+        local time = request.timeout or 1
         request.timestamp = os.time() + time
 
         self.write_fails = 0
@@ -685,9 +789,12 @@ function Server:process_requests()
   end
 
   if remove_request then
-    table.remove(self.request_list, remove_request)
+    local request = table.remove(self.request_list, remove_request)
     if self.verbose then
       self:log("Request '%s' expired without response", remove_request)
+    end
+    if request.timeout_callback then
+      request.timeout_callback(request)
     end
   end
 
@@ -697,6 +804,8 @@ end
 ---Read the lsp server stdout, parse any responses, requests or
 ---notifications and properly dispatch signals to any listeners.
 function Server:process_responses()
+  if not self.proc then return end
+
   local responses = self:read_responses(0)
 
   if type(responses) == "table" then
@@ -778,6 +887,8 @@ end
 ---because of not flushing the stderr (especially true of clangd).
 ---@param log_errors boolean
 function Server:process_errors(log_errors)
+  if not self.proc then return end
+
   local errors = self:read_errors(0)
 
   if #errors > 0 and log_errors then
@@ -794,12 +905,15 @@ end
 ---@return boolean sent
 ---@return string? errmsg
 function Server:send_data(data)
+  local proc = self.proc -- save current process to avoid it changing
+  if not proc then return false end
+
   local failures, data_len = 0, #data
-  local written, errmsg = self.proc:write(data)
+  local written, errmsg = proc:write(data)
   local total_written = written or 0
 
   while total_written < data_len and not errmsg do
-    written, errmsg = self.proc:write(data:sub(total_written + 1))
+    written, errmsg = proc:write(data:sub(total_written + 1))
     total_written = total_written + (written or 0)
 
     if (not written or written <= 0) and not errmsg and coroutine.running() then
@@ -839,7 +953,7 @@ function Server:process_raw()
     return
   end
 
-  if not self.proc:running() then
+  if not self.proc or not self.proc:running() then
     self.raw_list = {}
     return
   end
@@ -851,8 +965,7 @@ function Server:process_raw()
     -- first send the header
     if
       not self:send_data(string.format(
-        'Content-Length: %d\r\n\r\n',
-        #raw.raw_data + 2 -- last \r\n
+        'Content-Length: %d\r\n\r\n', #raw.raw_data
       ))
     then
       break
@@ -864,9 +977,14 @@ function Server:process_raw()
 
     -- send content in chunks
     local chunks = 10 * 1024
-    raw.raw_data = raw.raw_data .. "\r\n"
+    raw.raw_data = raw.raw_data
 
     while #raw.raw_data > 0 do
+      if not self.proc or not self.proc:running() then
+        self.raw_list = {}
+        return
+      end
+
       if #raw.raw_data > chunks then
         -- TODO: perform proper error handling
         self:send_data(raw.raw_data:sub(1, chunks))
@@ -949,13 +1067,13 @@ function Server:push_notification(method, options)
 
   if options.overwrite then
     for _, notification in ipairs(self.notification_list) do
-      if notification.method == method then
+      if notification.method == method and not notification.sending then
         if self.verbose then
           self:log("Overwriting notification %s", tostring(method))
         end
         notification.params = options.params
-        notification.callback = options.callback or nil
-        notification.data = options.data or nil
+        notification.callback = options.callback
+        notification.data = options.data
         return
       end
     end
@@ -983,8 +1101,8 @@ function Server:push_notification(method, options)
   table.insert(self.notification_list, {
     method = method,
     params = options.params,
-    callback = options.callback or nil,
-    data = options.data or nil
+    callback = options.callback,
+    data = options.data,
   })
 end
 
@@ -1011,9 +1129,11 @@ function Server:push_request(method, options)
           break
         else
           request.params = options.params
-          request.callback = options.callback or nil
-          request.overwritten_callback = options.overwritten_callback or nil
-          request.data = options.data or nil
+          request.callback = options.callback
+          request.overwritten_callback = options.overwritten_callback
+          request.data = options.data
+          request.timeout = options.timeout
+          request.timeout_callback = options.timeout_callback
           request.timestamp = 0
           if self.verbose then
             self:log("Overwriting request %s", tostring(method))
@@ -1046,9 +1166,11 @@ function Server:push_request(method, options)
     id = self.current_request,
     method = method,
     params = options.params,
-    callback = options.callback or nil,
-    overwritten_callback = options.overwritten_callback or nil,
-    data = options.data or nil,
+    callback = options.callback,
+    overwritten_callback = options.overwritten_callback,
+    data = options.data,
+    timeout = options.timeout,
+    timeout_callback = options.timeout_callback,
     timestamp = 0,
     times_sent = 0
   })
@@ -1095,8 +1217,8 @@ function Server:push_raw(name, options)
       if request.method == name then
         if not request.sending then
           request.raw_data = options.raw_data
-          request.callback = options.callback or nil
-          request.data = options.data or nil
+          request.callback = options.callback
+          request.data = options.data
           if self.verbose then
             self:log("Overwriting raw request %s", tostring(name))
           end
@@ -1115,8 +1237,8 @@ function Server:push_raw(name, options)
   table.insert(self.raw_list, {
     method = name,
     raw_data = options.raw_data,
-    callback = options.callback or nil,
-    data = options.data or nil
+    callback = options.callback,
+    data = options.data,
   })
 end
 
@@ -1133,150 +1255,123 @@ function Server:pop_request(id)
   return nil
 end
 
----Try to fetch a server rsponses, notifications or requests
+---Try to fetch a server responses, notifications or requests
 ---in a specific amount of time.
 ---@param timeout integer Time in seconds, set to 0 to not wait
 ---@return table[]|boolean Responses list or false if failed
 function Server:read_responses(timeout)
-  if not self.proc:running() then
+  local proc = self.proc -- save current process to avoid it changing
+  if not proc or not proc:running() then
+    return false
+  end
+
+  if not self.read_responses_coroutine then
+    self.read_responses_coroutine = coroutine.create(function()
+      local buffer = ""
+      while true do
+        -- Read out all the headers
+        local output = buffer .. (proc:read_stdout(Server.BUFFER_SIZE) or "")
+        local content_start = output:match("\r\n\r\n()")
+        local buf = output
+        while not content_start do
+          if #output > 1024 then
+            -- After a kilobyte, still no end in sight for headers. Error out.
+            return error(string.format("Can't find headers delimiter after %d bytes. "..
+                                       "Something wrong with the server configuration?\nGot:\n%s", #output, output))
+          end
+          coroutine.yield(#buf > 0)
+          buf = proc:read_stdout(Server.BUFFER_SIZE)
+          if not buf then
+            -- If we stopped in the middle of a read, error out
+            if #output > 0 then
+              return error(string.format("Can't continue reading stdout:\n%s", output))
+            end
+            return
+          end
+          if #buf > 0 then
+            output = output .. buf
+            content_start = output:match("\r\n\r\n()")
+          end
+        end
+
+        -- Parse headers
+        local headers_data = output:sub(1, content_start - 4 - 1)
+        local content_length = 0
+        local headers = util.split(headers_data, "\r\n")
+        for _, header in ipairs(headers) do
+          -- We only care for Content-Length for now
+          local length = header:match("^Content%-Length: (%d+)$")
+          if length then
+            content_length = tonumber(length)
+            break
+          end
+        end
+        if not content_length then
+          return error(string.format("Bad header content:\n%s\n", headers_data))
+        end
+
+        -- Read all the expected content data
+        local content_data_t = { output:sub(content_start) }
+        buf = content_data_t[1]
+        local content_read_length = #buf
+        while content_read_length < content_length do
+          coroutine.yield(#buf > 0)
+          buf = proc:read_stdout(Server.BUFFER_SIZE)
+          if not buf then
+            return error(string.format("Can't continue reading stdout. Stopped at %d/%d.\n%s",
+                                       content_read_length, content_length, table.concat(content_data_t)))
+          end
+          content_read_length = content_read_length + #buf
+          table.insert(content_data_t, buf)
+        end
+        local content_data = table.concat(content_data_t)
+        -- We only need content_length bytes, so queue the rest for the next loop
+        buffer = content_data:sub(content_length + 1)
+        content_data = content_data:sub(1, content_length)
+
+        if self.verbose then
+          self:log("Got data.\nHeaders:\n%s\n\nContent:\n%s", headers_data, content_data)
+        end
+
+        coroutine.yield(#buffer > 0, content_data)
+      end
+    end)
+  end
+
+  if coroutine.status(self.read_responses_coroutine) == "dead" then
+    self.fatal_error = true
+    self:shutdown_if_needed()
     return false
   end
 
   timeout = timeout or Server.DEFAULT_TIMEOUT
-  local inside_coroutine = self.yield_on_reads and coroutine.running() or false
-
-  local max_time = os.time() + timeout
-  if timeout == 0 then max_time = max_time + 1 end
-  local output = ""
-  while max_time > os.time() and output == "" do
-    output = self.proc:read_stdout(Server.BUFFER_SIZE)
-    if timeout == 0 then break end
-    if output == "" and inside_coroutine then
-      coroutine.yield()
-    end
-  end
-
-  if output == nil then
-    return false
-  end
+  local max_time = timeout == 0 and math.huge or system.get_time() + timeout
 
   local responses = {}
-  local readmode = ""
-
-  local bytes = 0;
-  if output ~= "" then
-    -- Make sure we retrieve everything
-    local more_output = nil
-    while more_output ~= "" do
-      more_output = self.proc:read_stdout(Server.BUFFER_SIZE)
-      if more_output ~= "" then
-        if more_output == nil then
-          break
-        end
-        output = output .. more_output
-        if inside_coroutine then
-          coroutine.yield()
-        end
-      end
+  repeat
+    local status, has_more_data, response = coroutine.resume(self.read_responses_coroutine)
+    if response then table.insert(responses, response) end
+    if not status then
+      local error_msg = has_more_data
+      self:log("Disconnecting from server:\n%s", error_msg)
+      self.fatal_error = true
+      self:shutdown_if_needed()
+      return false
     end
-
-    if output:find('^Content%-Length: %d+\r\n') then
-      bytes = tonumber(output:match("%d+"))
-
-      local header_content = util.split(output, "\r\n\r\n")
-
-      -- in case the response sent both header and content or
-      -- more than one response at the same time
-      if #header_content > 1 and #header_content[2] >= bytes then
-        -- retrieve rest of output
-        local new_output = nil
-        while new_output ~= "" do
-          new_output = self.proc:read_stdout(Server.BUFFER_SIZE)
-          if new_output ~= "" then
-            if new_output == nil then
-              break
-            end
-            output = output .. new_output
-            if inside_coroutine then
-              coroutine.yield()
-            end
-          end
-        end
-
-        -- iterate every output
-        header_content = util.split(output, "\r\n\r\n")
-        bytes = 0
-        for _, content in pairs(header_content) do
-          if bytes == 0 and content:find('Content%-Length: %d+') then
-            bytes =  tonumber(content:match("Content%-Length: (%d+)"))
-          elseif bytes and #content >= bytes then
-            local data = string.sub(content, 1, bytes)
-            table.insert(responses, data)
-            if content:find('Content%-Length: %d+') then
-              bytes =  tonumber(content:match("Content%-Length: (%d+)"))
-            else
-              bytes = 0
-            end
-          end
-        end
-
-        readmode = "Response header and content received at once:\n"
-
-        if self.verbose then
-          self:log(
-            readmode .. "%s",
-            output
-          )
-        end
-      else
-        -- store partial content if available
-        if #header_content > 1 and #header_content[2] > 0 then
-          output = header_content[2]
-        else
-          output = ""
-        end
-
-        -- read again to retrieve full response content
-        while #output < bytes do
-          local chars = self.proc:read_stdout(bytes - #output)
-          if #chars > 0 then
-            output = output .. chars
-          end
-          if inside_coroutine then
-            coroutine.yield()
-          end
-        end
-
-        table.insert(responses, output)
-
-        readmode = "Response header and content received separately:\n"
-
-        if self.verbose then
-          self:log(
-            readmode .. "%s",
-            output
-          )
-        end
-      end
-    elseif #output > 0 then
-      if self.verbose then
-        self:log("Output without header:\n%s", output)
-      end
-    end
-  end
+  until not has_more_data or (timeout > 0 and system.get_time() >= max_time)
 
   if #responses > 0 then
-    for index,data in pairs(responses) do
-      data = json.decode(data)
-      if data ~= false then
-        responses[index] = data
+    for index, data in ipairs(responses) do
+      local json_data = json.decode(data)
+      if json_data ~= false then
+        responses[index] = json_data
       else
         responses[index] = nil
         self:log(
           "JSON Parser Error: %s\n%s\n%s",
           json.last_error(),
-          readmode,
-          output
+          "-----",
+          data
         )
         return false
       end
@@ -1299,6 +1394,9 @@ end
 ---@param timeout integer Time in seconds, set to 0 to not wait
 ---@return string|nil
 function Server:read_errors(timeout)
+  local proc = self.proc -- save current process to avoid it changing
+  if not proc then return "" end
+
   timeout = timeout or Server.DEFAULT_TIMEOUT
   local inside_coroutine = self.yield_on_reads and coroutine.running() or false
 
@@ -1306,7 +1404,7 @@ function Server:read_errors(timeout)
   if timeout == 0 then max_time = max_time + 1 end
   local output = ""
   while max_time > os.time() and output == "" do
-    output = self.proc:read_stderr(Server.BUFFER_SIZE)
+    output = proc:read_stderr(Server.BUFFER_SIZE)
     if timeout == 0 then break end
     if output == "" and inside_coroutine then
       coroutine.yield()
@@ -1316,7 +1414,7 @@ function Server:read_errors(timeout)
   if timeout == 0 and output ~= "" then
     local new_output = nil
     while new_output ~= "" do
-      new_output = self.proc:read_stderr(Server.BUFFER_SIZE)
+      new_output = proc:read_stderr(Server.BUFFER_SIZE)
       if new_output ~= "" then
         if new_output == nil then
           break
@@ -1337,7 +1435,7 @@ end
 ---@return boolean written
 ---@return string? errmsg
 function Server:write_request(data)
-  if not self.proc:running() then
+  if not self.proc or not self.proc:running() then
     return false
   end
 
@@ -1348,8 +1446,8 @@ function Server:write_request(data)
   -- WARNING: send_data performs yielding which can pontentially cause a
   -- race condition, in case of future issues this may be the root cause.
   return self:send_data(string.format(
-    'Content-Length: %d\r\n\r\n%s\r\n',
-    #data + 2,
+    'Content-Length: %d\r\n\r\n%s',
+    #data,
     data
   ))
 end
@@ -1379,7 +1477,7 @@ end
 function Server:on_response(response, request)
   if self.verbose then
     self:log(
-      "Recieved response '%s' with result:\n%s",
+      "Received response '%s' with result:\n%s",
       response.id,
       util.jsonprettify(json.encode(response))
     )
@@ -1396,7 +1494,11 @@ function Server:add_request_listener(method, callback)
       method
     )
   end
-  self.request_listeners[method] = callback
+
+  if not self.request_listeners[method] then
+    self.request_listeners[method] = {}
+  end
+  table.insert(self.request_listeners[method], callback)
 end
 
 ---Call an apropriate signal handler for a given request.
@@ -1413,9 +1515,9 @@ function Server:send_request_signal(request)
   end
 
   if self.request_listeners[request.method] then
-    self.request_listeners[request.method](
-      self, request
-    )
+    for _, l in ipairs(self.request_listeners[request.method]) do
+      l(self, request)
+    end
   else
     self:on_request(request)
   end
@@ -1426,7 +1528,7 @@ end
 function Server:on_request(request)
   if self.verbose then
     self:log(
-      "Recieved request '%s' with data:\n%s",
+      "Received request '%s' with data:\n%s",
       request.method,
       util.jsonprettify(json.encode(request))
     )
@@ -1455,16 +1557,20 @@ function Server:add_message_listener(method, callback)
       method
     )
   end
-  self.message_listeners[method] = callback
+
+  if not self.message_listeners[method] then
+    self.message_listeners[method] = {}
+  end
+  table.insert(self.message_listeners[method], callback)
 end
 
 ---Call an apropriate signal handler for a given message or notification.
 ---@param message table
 function Server:send_message_signal(message)
   if self.message_listeners[message.method] then
-    self.message_listeners[message.method](
-      self, message.params
-    )
+    for _, l in ipairs(self.message_listeners[message.method]) do
+      l(self, message.params)
+    end
   else
     self:on_message(message.method, message.params)
   end
@@ -1476,23 +1582,38 @@ end
 function Server:on_message(method, params)
   if self.verbose then
     self:log(
-      "Recieved notification '%s' with params:\n%s",
+      "Received notification '%s' with params:\n%s",
       method,
       util.jsonprettify(json.encode(params))
     )
   end
 end
 
+---Return the languageId for the specified doc.
+---@param doc core.doc
+---@return string
+function Server:get_language_id(doc)
+  if type(self.language) == "string" then
+    return self.language
+  else
+    for _, l in ipairs(self.language) do
+      if string.match(doc.abs_filename, l.pattern) then
+        return l.id
+      end
+    end
+  end
+  return util.file_extension(doc.filename)
+end
+
 ---Kills the server process and deinitialize the server object state.
 function Server:stop()
   self.initialized = false
-  self.proc:kill()
+  self.proc = nil
 
   self.request_list = {}
   self.response_list = {}
   self.notification_list = {}
   self.raw_list = {}
-  self.running = false
 end
 
 ---Shutdown the server if not running or amount of write fails
@@ -1501,7 +1622,9 @@ function Server:shutdown_if_needed()
   if
     self.write_fails >= self.write_fails_before_shutdown
     or
-    not self.proc:running()
+    (self.proc and not self.proc:running())
+    or
+    self.fatal_error
   then
     self:stop()
     self:on_shutdown()
@@ -1531,9 +1654,6 @@ function Server:exit()
 
   -- send exit notification
   self:notify('exit')
-
-  -- wait 1 second until it exits
-  self.proc:wait(1000)
 
   self:stop()
 end

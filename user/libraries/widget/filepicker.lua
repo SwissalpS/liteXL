@@ -6,6 +6,7 @@ local Button = require "libraries.widget.button"
 local Label = require "libraries.widget.label"
 
 ---@class widget.filepicker : widget
+---@overload fun(parent?:widget, path?:string):widget.filepicker
 ---@field public pick_mode integer
 ---@field public filters table<integer,string>
 ---@field private path string
@@ -205,7 +206,7 @@ end
 function FilePicker:set_filename(name)
   local dir_part = common.dirname(self.path)
   if dir_part then
-    self:set_path(dir_part .. "/" .. name)
+    self:set_path(dir_part .. PATHSEP .. name)
   else
     self:set_path(name)
   end
@@ -216,7 +217,7 @@ end
 function FilePicker:get_filename()
   local dir_part = common.dirname(self.path)
   if dir_part then
-    local filename = str_replace(self.path, dir_part .. "/", "")
+    local filename = str_replace(self.path, dir_part .. PATHSEP, "")
     return filename
   elseif self.path ~= "" then
     return self.path
@@ -229,7 +230,7 @@ end
 function FilePicker:set_directory(dir)
   local filename = self:get_filename()
   if filename then
-    self:set_path(dir:gsub("[\\/]$", "") .. "/" .. filename)
+    self:set_path(dir:gsub("[\\/]$", "") .. PATHSEP .. filename)
   else
     self:set_path(dir:gsub("[\\/]$", ""))
   end
@@ -283,10 +284,10 @@ local function show_file_picker(self)
       if dirname then
         filename = common.home_expand(text)
         filename = system.absolute_path(dirname)
-          .. "/"
-          .. str_replace(filename, dirname .. "/", "")
+          .. PATHSEP
+          .. str_replace(filename, dirname .. PATHSEP, "")
       elseif filename ~= "" then
-        filename = core.project_dir .. "/" .. filename
+        filename = core.project_dir .. PATHSEP .. filename
       end
       self:set_path(filename)
       self:on_change(filename ~= "" and filename or nil)
