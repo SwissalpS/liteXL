@@ -10,9 +10,68 @@ end -- add lintplus context-item
 
 
 local core = require 'core'
+local command = require "core.command"
 --local tDump = require('plugins.dump')local d, pd = table.unpack(tDump)
 
--- modify contextmenu if available
+-- Add treeview contextmenu items: open as project and open with git-cola
+if false ~= config.plugins.treeview and false ~= config.plugins.contextmenu then
+	core.add_thread(function()
+		-- Make sure other deferred loads have run.
+		-- i.e. TreeView deferring ContextMenu
+		coroutine.yield(.3)
+
+		local _, treeview, treemenu
+		_, treeview = pcall(require, "plugins.treeview")
+		treemenu = treeview and treeview.contextmenu
+
+		if not treemenu then
+			return
+		end
+
+		command.add(function()
+			return treeview.hovered_item ~= nil, treeview.hovered_item
+		end, {
+			["user-contextmenu:open-as-project"] = function(item)
+				if not (item and item.abs_filename) then
+					core.error("Cannot open location")
+					return
+				end
+				system.exec(string.format("%q %q", EXEFILE, item.abs_filename))
+			end
+		})
+
+		treemenu:register(nil, {
+			{
+				text = "Open as project",
+				command = "user-contextmenu:open-as-project",
+			},
+		})
+
+		command.add(function()
+			return treeview.hovered_item ~= nil, treeview.hovered_item
+		end, {
+			["user-contextmenu:open-with-git-cola"] = function(item)
+				if not (item and item.abs_filename) then
+					core.error("Cannot open location")
+					return
+				end
+				system.exec(string.format("git-cola -r %q", item.abs_filename))
+			end
+		})
+
+		treemenu:register(nil, {
+			{
+				text = "Open with git-cola",
+				command = "user-contextmenu:open-with-git-cola",
+			},
+		})
+	end)
+end
+
+
+-- Modify contextmenu if available.
+-- Remove never used entries because the keybindings are second
+-- nature or there are other easier ways to get the job done.
 local iCountRuns = 0
 local cm = nil
 core.add_thread(function()
