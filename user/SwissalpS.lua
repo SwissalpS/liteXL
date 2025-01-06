@@ -1,4 +1,5 @@
---local config = require "core.config"
+local config = require "core.config"
+config.stonks = nil
 --config.plugins.lsp = false
 
 require "lintplus"
