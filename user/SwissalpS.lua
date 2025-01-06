@@ -1,9 +1,9 @@
 local config = require "core.config"
 config.stonks = nil
---config.plugins.lsp = false
 
 require "lintplus"
--- Needs to be setup first in user/lintplus.lua
+config.plugins.lsp = false
+-- Needs to be setup first in user/lsp.lua
 --require "lsp"
 require "keymap"
 require "contextmenu"
