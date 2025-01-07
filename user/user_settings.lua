@@ -48,9 +48,9 @@ return {
       ["lintplus"] = true,
       ["lsp"] = true,
       ["lsp_lua"] = true,
-      ["lsp_snippets"] = true,
       ["minimap"] = true,
       ["snippets"] = true,
+      ["sticky_scroll"] = true,
       ["todotreeview"] = true,
       ["toolbarview"] = true
     },
@@ -69,6 +69,7 @@ return {
       ["eval"] = true,
       ["gitdiff_highlight"] = true,
       ["indentguide"] = true,
+      ["lsp_snippets"] = true,
       ["scale"] = true,
       ["selectionhighlight"] = true,
       ["spellcheck"] = true
@@ -136,6 +137,11 @@ return {
         ["mode"] = "word",
         ["require_tokenization"] = true
       },
+      ["lsp"] = {
+        ["autostart_server"] = true,
+        ["mouse_hover"] = false,
+        ["show_diagnostics"] = true
+      },
       ["minimap"] = {
         ["caret_color"] = {
           [1] = 147,
@@ -155,6 +161,9 @@ return {
         ["mode"] = "code",
         ["use_mousewheel"] = true
       },
+      ["snippets"] = {
+        ["autoexit"] = true
+      },
       ["spellcheck"] = {
         ["files"] = {
           [1] = "%.txt$",
@@ -163,6 +172,9 @@ return {
           [4] = "%.tr$",
           [5] = "%.po$"
         }
+      },
+      ["sticky_scroll"] = {
+        ["enabled"] = false
       },
       ["trimwhitespace"] = {
         ["enabled"] = true,
@@ -178,3 +190,4 @@ return {
     ["transitions"] = false
   }
 }
+
