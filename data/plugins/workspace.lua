@@ -1,8 +1,35 @@
 -- mod-version:3
 local core = require "core"
+local command = require "core.command"
 local common = require "core.common"
+local config = require "core.config"
 local DocView = require "core.docview"
 local LogView = require "core.logview"
+
+config.plugins.workspace = common.merge({
+  periodic_save = false,
+  interval_seconds = 7 * 60,
+  -- The config specification used by the settings gui
+  config_spec = {
+    name = "Workspace",
+    {
+      label = "Periodically Save Workspace",
+      description = "Save workspace while using lite-xl.",
+      path = "periodic_save",
+      type = "toggle",
+      default = false
+    },
+    {
+      label = "Save Interval",
+      description = "Frequency, in seconds, to save workspace.",
+      path = "interval_seconds",
+      type = "number",
+      default = 7 * 60,
+      min = 60,
+      step = 30
+    }
+  }
+}, config.plugins.workspace)
 
 
 local function workspace_files_for(project_dir)
@@ -35,7 +62,7 @@ local function consume_workspace_file(project_dir)
     local load_f = loadfile(filename)
     local workspace = load_f and load_f()
     if workspace and workspace.path == project_dir then
-      os.remove(filename)
+      --os.remove(filename)
       return workspace
     end
   end
@@ -44,7 +71,13 @@ end
 
 local function get_workspace_filename(project_dir)
   local id_list = {}
+  local load_f, workspace
   for filename, id in workspace_files_for(project_dir) do
+    load_f = loadfile(filename)
+    workspace = load_f and load_f()
+    if workspace and workspace.path == project_dir then
+      return filename
+    end
     id_list[id] = true
   end
   local id = 1
@@ -94,7 +127,10 @@ local function save_view(view)
         type = "view",
         active = (core.active_view == view),
         module = name,
-        scroll = { x = view.scroll.to.x, y = view.scroll.to.y, to = { x = view.scroll.to.x, y = view.scroll.to.y } },
+        scroll = {
+          x = view.scroll.to.x, y = view.scroll.to.y,
+          to = { x = view.scroll.to.x, y = view.scroll.to.y }
+        },
       }
     end
   end
@@ -114,6 +150,8 @@ local function load_view(t)
         dv = DocView(doc)
       end
     end
+    -- doc view "dv" can be nil here if the filename associated to the document
+    -- cannot be read.
     if dv and dv.doc then
       if dv.doc.new_file and t.text then
         dv.doc:insert(1, 1, t.text)
@@ -166,7 +204,7 @@ local function load_node(node, t)
           active_view = view
         end
         if not view:is(DocView) then
-          view.scroll = v.scroll	
+          view.scroll = v.scroll
         end
       end
     end
@@ -222,6 +260,11 @@ local function load_workspace()
 end
 
 
+local function try_save_workspace()
+  core.try(save_workspace)
+end
+
+
 local run = core.run
 
 function core.run(...)
@@ -230,7 +273,7 @@ function core.run(...)
 
     local on_quit_project = core.on_quit_project
     function core.on_quit_project()
-      core.try(save_workspace)
+      try_save_workspace()
       on_quit_project()
     end
 
@@ -244,3 +287,20 @@ function core.run(...)
   core.run = run
   return core.run(...)
 end
+
+-- deferred startup of auto save
+core.add_thread(function()
+  if not config.plugins.workspace.periodic_save then return end
+
+  core.add_thread(function()
+    repeat
+      coroutine.yield(config.plugins.workspace.interval_seconds)
+      core.try(save_workspace)
+    until false
+  end)
+end)
+
+
+command.add(nil, {
+    ["workspace:save-workspace"] = try_save_workspace
+})
