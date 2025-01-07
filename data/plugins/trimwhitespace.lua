@@ -6,23 +6,41 @@ local Doc = require "core.doc"
 
 ---@class config.plugins.trimwhitespace
 ---@field enabled boolean
+---@field trim_trailing boolean
 ---@field trim_empty_end_lines boolean
+---@field leave_last boolean
 config.plugins.trimwhitespace = common.merge({
   enabled = false,
+  trim_trailing = true,
   trim_empty_end_lines = false,
+  leave_last = false,
   config_spec = {
     name = "Trim Whitespace",
     {
       label = "Enabled",
-      description = "Disable or enable the trimming of white spaces by default.",
+      description = "Enable trimming of white space when saving file.",
       path = "enabled",
       type = "toggle",
-      default = false
+      defalt = false
+    },
+    {
+      label = "Trim Lines",
+      description = "Remove any trailing whitespace from lines.",
+      path = "trim_trailing",
+      type = "toggle",
+      default = true
     },
     {
       label = "Trim Empty End Lines",
       description = "Remove any empty new lines at the end of documents.",
       path = "trim_empty_end_lines",
+      type = "toggle",
+      default = false
+    },
+    {
+      label = "Leave One Empty End Line",
+      description = "VIM-compatibility, leaves one NL at EOF (If \"Trim Empty End Lines\" is active.",
+      path = "leave_last",
       type = "toggle",
       default = false
     }
@@ -42,6 +60,30 @@ end
 ---@param doc core.doc
 function trimwhitespace.enable(doc)
   doc.disable_trim_whitespace = nil
+end
+
+---Disable trim NL at EOF for a specific document.
+---@param doc core.doc
+function trimwhitespace.disable_trim_empty_NL(doc)
+  doc.disable_trim_whitespace_empty_NL = true
+end
+
+---Re-enable trim NL at EOF if previously disabled.
+---@param doc core.doc
+function trimwhitespace.enable_trim_empty_NL(doc)
+  doc.disable_trim_whitespace_empty_NL = nil
+end
+
+---Disable leave last for a specific document.
+---@param doc core.doc
+function trimwhitespace.disable_leave_last(doc)
+  doc.disable_trim_whitespace_leave_last = true
+end
+
+---Re-enable leave last if previously disabled.
+---@param doc core.doc
+function trimwhitespace.enable_leave_last(doc)
+  doc.disable_trim_whitespace_leave_last = nil
 end
 
 ---Perform whitespace trimming in all lines of a document except the
@@ -65,24 +107,33 @@ function trimwhitespace.trim(doc)
   end
 end
 
----Removes all empty new lines at the end of the document.
+---Removes empty new lines at the end of the document.
 ---@param doc core.doc
 ---@param raw_remove? boolean Perform the removal not registering to undo stack
 function trimwhitespace.trim_empty_end_lines(doc, raw_remove)
-  for _=#doc.lines, 1, -1 do
+  for _ = #doc.lines, 1, -1 do
     local l = #doc.lines
     if l > 1 and doc.lines[l] == "\n" then
       local current_line = doc:get_selection()
       if current_line == l then
-        doc:set_selection(l-1, math.huge, l-1, math.huge)
+        doc:set_selection(l - 1, math.huge, l - 1, math.huge)
       end
-      if not raw_remove then
-        doc:remove(l-1, math.huge, l, math.huge)
-      else
+      if raw_remove then
         table.remove(doc.lines, l)
+      else
+        doc:remove(l - 1, math.huge, l, math.huge)
       end
     else
       break
+    end
+  end
+  if config.plugins.trimwhitespace.leave_last
+    and not doc.disable_trim_whitespace_leave_last
+  then
+    if raw_remove then
+      doc.lines[#doc.lines + 1] = "\n"
+    else
+      doc:insert(math.huge, math.huge, "\n")
     end
   end
 end
@@ -96,20 +147,48 @@ command.add("core.docview", {
   ["trim-whitespace:trim-empty-end-lines"] = function(dv)
     trimwhitespace.trim_empty_end_lines(dv.doc)
   end,
+
+  ["trim-whitespace:disable-trimming-this-document"] = function(dv)
+    trimwhitespace.disable(dv.doc)
+  end,
+
+  ["trim-whitespace:enable-trimming-this-document"] = function(dv)
+    trimwhitespace.enable(dv.doc)
+  end,
+
+  ["trim-whitespace:disable-trimming-NL-at-EOF-this-document"] = function(dv)
+    trimwhitespace.disable_trim_empty_NL(dv.doc)
+  end,
+
+  ["trim-whitespace:enable-trimming-NL-at-EOF-this-document"] = function(dv)
+    trimwhitespace.enable_trim_empty_NL(dv.doc)
+  end,
+
+  ["trim-whitespace:disable-leaving-last-NL-this-document"] = function(dv)
+    trimwhitespace.disable_leave_last(dv.doc)
+  end,
+
+  ["trim-whitespace:enable-leaving-last-NL-this-document"] = function(dv)
+    trimwhitespace.enable_leave_last(dv.doc)
+  end
 })
 
 
 local doc_save = Doc.save
-Doc.save = function(self, ...)
-  if
-    config.plugins.trimwhitespace.enabled
-    and
-    not self.disable_trim_whitespace
+function Doc:save(...)
+  if not config.plugins.trimwhitespace.enabled then
+    return doc_save(self, ...)
+  end
+
+  if config.plugins.trimwhitespace.trim_trailing
+    and not self.disable_trim_whitespace
   then
     trimwhitespace.trim(self)
-    if config.plugins.trimwhitespace.trim_empty_end_lines then
+  end
+  if config.plugins.trimwhitespace.trim_empty_end_lines
+    and not self.disable_trim_empty_NL
+  then
       trimwhitespace.trim_empty_end_lines(self)
-    end
   end
   doc_save(self, ...)
 end
