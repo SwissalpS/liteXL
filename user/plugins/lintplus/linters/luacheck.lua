@@ -60,3 +60,4 @@ lintplus.add("luacheck") {
     }
   },
 }
+

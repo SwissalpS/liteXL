@@ -865,7 +865,7 @@ lspconfig.tsserver = add_lsp {
   verbose = false
 }
 
----# typst-lsp 
+---# typst-lsp
 --- __Status: Works
 --- __Site__: https://github.com/nvarner/typst-lsp
 --- __Instalation__: `yay typst-lsp-bin`
@@ -954,3 +954,4 @@ lspconfig.zls = add_lsp {
 }
 
 return lspconfig
+
