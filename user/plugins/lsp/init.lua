@@ -875,7 +875,7 @@ function lsp.start_server(filename, project_directory)
                 doc_view.doc:set_selection(line1, col1, line2, col2)
               end
               if request.params.takeFocus then
-                system.raise_window()
+                system.raise_window(core.window)
               end
             end
 

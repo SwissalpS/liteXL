@@ -106,7 +106,7 @@ local function sort_helper(a, b)
   return a.severity < b.severity
 end
 
----Helper to catch some trange occurances where nil is given as filename
+---Helper to catch some strange occurances where nil is given as filename
 ---@param filename string|nil
 ---@return string | nil
 local function get_absolute_path(filename)

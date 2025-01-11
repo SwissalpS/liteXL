@@ -13,6 +13,7 @@ local json = require "plugins.lsp.json"
 local util = require "plugins.lsp.util"
 local diagnostics = require "plugins.lsp.diagnostics"
 local Object = require "core.object"
+local common = require "core.common"
 
 ---@alias lsp.server.callback fun(server: lsp.server, ...)
 ---@alias lsp.server.timeoutcb fun(server: lsp.server, ...)
@@ -362,6 +363,26 @@ function Server:initialize(workspace, editor_name, editor_version)
   self.editor_name = editor_name or "unknown"
   self.editor_version = editor_version or "0.1"
 
+  local check_path, luarc_path, file_info
+  local get_file_info = system.get_file_info
+  local workspaces = {}
+  for _, filename in ipairs(system.list_dir(workspace) or {}) do
+    check_path = workspace .. PATHSEP .. filename
+    file_info = get_file_info(check_path)
+    if file_info and 'dir' == file_info.type then
+      luarc_path = check_path .. PATHSEP .. '.luarc.json'
+      file_info = get_file_info(luarc_path)
+      if file_info and 'file' == file_info.type then
+        table.insert(workspaces, {
+          uri = util.touri(check_path), name = common.basename(check_path)
+        })
+      end
+    end
+  end
+  if 0 == #workspaces then
+    workspaces = { uri = root_uri, name = common.basename(workspace) }
+  end
+
   self:push_request('initialize', {
     timeout = 10,
     params = {
@@ -373,9 +394,7 @@ function Server:initialize(workspace, editor_name, editor_version)
       -- TODO: locale
       rootPath = workspace,
       rootUri = root_uri,
-      workspaceFolders = {
-        {uri = root_uri, name = util.getpathname(workspace)}
-      },
+      workspaceFolders = workspaces,
       initializationOptions = self.init_options,
       capabilities = util.deep_merge({
         workspace = {
