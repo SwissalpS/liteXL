@@ -357,31 +357,11 @@ end
 ---@param editor_name? string
 ---@param editor_version? string
 function Server:initialize(workspace, editor_name, editor_version)
-  local root_uri = util.touri(workspace);
+  local root_uri = util.touri(workspace)
 
   self.path = workspace or ""
   self.editor_name = editor_name or "unknown"
   self.editor_version = editor_version or "0.1"
-
-  local check_path, luarc_path, file_info
-  local get_file_info = system.get_file_info
-  local workspaces = {}
-  for _, filename in ipairs(system.list_dir(workspace) or {}) do
-    check_path = workspace .. PATHSEP .. filename
-    file_info = get_file_info(check_path)
-    if file_info and 'dir' == file_info.type then
-      luarc_path = check_path .. PATHSEP .. '.luarc.json'
-      file_info = get_file_info(luarc_path)
-      if file_info and 'file' == file_info.type then
-        table.insert(workspaces, {
-          uri = util.touri(check_path), name = common.basename(check_path)
-        })
-      end
-    end
-  end
-  if 0 == #workspaces then
-    workspaces = { uri = root_uri, name = common.basename(workspace) }
-  end
 
   self:push_request('initialize', {
     timeout = 10,
@@ -394,7 +374,7 @@ function Server:initialize(workspace, editor_name, editor_version)
       -- TODO: locale
       rootPath = workspace,
       rootUri = root_uri,
-      workspaceFolders = workspaces,
+      workspaceFolders = self:get_workspace_folders(workspace),
       initializationOptions = self.init_options,
       capabilities = util.deep_merge({
         workspace = {
@@ -565,6 +545,35 @@ function Server:initialize(workspace, editor_name, editor_version)
       end
     end
   })
+end
+
+---Create a list of workspace definitions.
+---@param root_workspace string Path of project root.
+---@return table[] { [uri: string], [name: string] }
+function Server:get_workspace_folders(root_workspace)
+  local check_path, luarc_path, file_info
+  local get_file_info = system.get_file_info
+  local workspaces = {}
+  for _, filename in ipairs(system.list_dir(root_workspace) or {}) do
+    check_path = root_workspace .. PATHSEP .. filename
+    file_info = get_file_info(check_path)
+    if file_info and 'dir' == file_info.type then
+      luarc_path = check_path .. PATHSEP .. '.luarc.json'
+      file_info = get_file_info(luarc_path)
+      if file_info and 'file' == file_info.type then
+        table.insert(workspaces, {
+          uri = util.touri(check_path), name = common.basename(check_path)
+        })
+      end
+    end
+  end
+  if 0 == #workspaces then
+    table.insert(workspaces, {
+      uri = util.touri(root_workspace), name = common.basename(root_workspace)
+    })
+  end
+
+  return workspaces
 end
 
 ---Register an event listener.
